@@ -49,6 +49,13 @@ fn vs_uv(@builtin(vertex_index) i: u32) -> Full {
     return Full(vec4<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 0.0, 1.0), vec2<f32>(uv.x, 1.0 - uv.y));
 }
 
+// A final shader already uses the screen's top-row convention. Upscale without flipping.
+@vertex
+fn vs_present(@builtin(vertex_index) i:u32)->Full {
+    let uv=vec2<f32>(f32((i<<1u)&2u),f32(i&2u));
+    return Full(vec4<f32>(uv.x*2.0-1.0,1.0-uv.y*2.0,0.0,1.0),uv);
+}
+
 @fragment
 fn fs_copy(v: Full) -> @location(0) vec4<f32> {
     return textureSample(source, linear, v.uv);

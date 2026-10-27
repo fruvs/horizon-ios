@@ -26,6 +26,8 @@ pub(super) struct Stage<'p> {
     /// Name, type with its array suffix, token of the type.
     pub(super) uniforms: Vec<(String, String, usize)>,
     pub(super) samplers: Vec<(String, String)>,
+    /// Storage image name, type, optional layout format, and memory qualifiers.
+    pub(super) images: Vec<(String, String, Option<String>, String)>,
     pub(super) ins: Vec<Var>,
     pub(super) outs: Vec<Var>,
     /// Vertex inputs, now private globals, and the value our `main` gives each.
@@ -47,7 +49,7 @@ pub(super) struct Stage<'p> {
 }
 
 pub(super) const STORAGE: [&str; 5] = ["uniform", "in", "out", "attribute", "varying"];
-pub(super) const QUALIFIERS: [&str; 11] = [
+pub(super) const QUALIFIERS: [&str; 16] = [
     "flat",
     "smooth",
     "noperspective",
@@ -59,6 +61,11 @@ pub(super) const QUALIFIERS: [&str; 11] = [
     "precise",
     "sample",
     "const",
+    "coherent",
+    "volatile",
+    "restrict",
+    "readonly",
+    "writeonly",
 ];
 /// The compatibility profile's uniform state (with its `Inverse`/`Transpose` forms).
 pub(super) const UNIFORM_STATE: [&str; 5] = [
@@ -108,13 +115,51 @@ pub(super) fn is_ident(t: &str) -> bool {
 
 impl<'p> Stage<'p> {
     pub(super) fn scan(pp: &'p Preprocessed, kind: ShaderStage) -> Self {
+        let mut tokens = lex(&pp.code);
+        // GLSL permits dimensions on the type (`vec3[6] positions`); Naga expects
+        // them on the declarator. Array constructors keep their original syntax.
+        let mut i = 0;
+        while i < tokens.len() {
+            if is_ident(tokens[i]) {
+                let mut cursor = i + 1;
+                while cursor < tokens.len() && !significant(tokens[cursor]) {
+                    cursor += 1;
+                }
+                let first = cursor;
+                while tokens.get(cursor) == Some(&"[") {
+                    let mut depth = 1;
+                    cursor += 1;
+                    while cursor < tokens.len() && depth > 0 {
+                        match tokens[cursor] {
+                            "[" => depth += 1,
+                            "]" => depth -= 1,
+                            _ => {}
+                        }
+                        cursor += 1;
+                    }
+                    while cursor < tokens.len() && !significant(tokens[cursor]) {
+                        cursor += 1;
+                    }
+                }
+                if cursor > first && tokens.get(cursor).is_some_and(|t| is_ident(t)) {
+                    let after = (cursor + 1..tokens.len()).find(|&j| significant(tokens[j]));
+                    if after.is_some_and(|j| matches!(tokens[j], "=" | ";" | "," | ")")) {
+                        let name = tokens.remove(cursor);
+                        tokens.insert(first, name);
+                        tokens.insert(first, " ");
+                    }
+                }
+            }
+            i += 1;
+        }
         let mut s = Stage {
             kind,
             pp,
-            tokens: lex(&pp.code),
+            tokens,
             removed: Vec::new(),
             uniforms: Vec::new(),
             samplers: Vec::new(),
+            images: Vec::new(),
             ins: Vec::new(),
             outs: Vec::new(),
             attributes: Vec::new(),
@@ -236,6 +281,8 @@ impl<'p> Stage<'p> {
         let mut k = 0;
         let mut storage = None;
         let mut location = None;
+        let mut image_format = None;
+        let mut memory = String::new();
         let mut interpolation = String::new();
         while let Some(&i) = words.get(k) {
             let w = self.tokens[i];
@@ -244,6 +291,9 @@ impl<'p> Stage<'p> {
                 let mut j = k + 1;
                 while let Some(&t) = words.get(j) {
                     j += 1;
+                    if self.tokens[t].starts_with("r") && !matches!(self.tokens[t], "row_major") {
+                        image_format = Some(self.tokens[t].to_owned());
+                    }
                     if self.tokens[t] == "location" {
                         location = words
                             .get(j + 1)
@@ -259,6 +309,12 @@ impl<'p> Stage<'p> {
             if STORAGE.contains(&w) {
                 storage = Some(w);
             } else if QUALIFIERS.contains(&w) {
+                if matches!(
+                    w,
+                    "coherent" | "volatile" | "restrict" | "readonly" | "writeonly"
+                ) {
+                    write!(memory, "{w} ").unwrap();
+                }
                 if matches!(
                     w,
                     "flat" | "smooth" | "noperspective" | "centroid" | "sample"
@@ -313,9 +369,10 @@ impl<'p> Stage<'p> {
             let decl = format!("{interpolation}{ty} @{array};");
             match storage {
                 "uniform" if ty.contains("sampler") => self.samplers.push((name, ty.clone())),
-                "uniform" if ty.contains("image") => self
-                    .errors
-                    .push(self.error(ty_at, &format!("`{name}`: images are not supported yet"))),
+                "uniform" if ty.contains("image") => {
+                    self.images
+                        .push((name, ty.clone(), image_format.clone(), memory.clone()))
+                }
                 "uniform" => self.uniforms.push((name, format!("{ty}{array}"), ty_at)),
                 _ if input && !fragment => {
                     let value = attribute_value(&name, &ty);

@@ -1,5 +1,6 @@
 //! Chat, the command registries and the per-world state behind commands
 //! (game rules, the world clock, difficulty), bound to the game.
+use super::chat_input as input;
 use super::{Game, Screen};
 use horizon_client::{
     chat::{
@@ -516,6 +517,13 @@ impl Game<'_> {
             return;
         }
         let PhysicalKey::Code(key) = event.physical_key else {
+            if let Some(text) = input::text_without_physical_key(
+                event.physical_key,
+                event.state,
+                event.text.as_deref(),
+            ) {
+                self.chat_type(text);
+            }
             return;
         };
         self.chat_key_code(key, event.text.as_deref());

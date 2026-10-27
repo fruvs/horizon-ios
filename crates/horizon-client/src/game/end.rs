@@ -92,6 +92,16 @@ impl EndFlash {
     fn intensity(&self, partial: f32) -> f32 {
         self.old_intensity + (self.intensity - self.old_intensity) * partial
     }
+    /// SkyRenderer.renderEndFlash's pose of the flash quad (built at height 100).
+    fn pose(&self) -> glam::Mat4 {
+        glam::Mat4::from_rotation_y((180.0 - self.y_angle).to_radians())
+            * glam::Mat4::from_rotation_x((-90.0 - self.x_angle).to_radians())
+    }
+    /// The centre of the flash quad, in the sky's world axes around the camera.
+    fn center(&self) -> glam::Vec3 {
+        self.pose()
+            .transform_point3(glam::Vec3::new(0.0, 100.0, 0.0))
+    }
 }
 impl EndState {
     pub(super) fn locator(&self) -> Option<Arc<VanillaTerrain>> {
@@ -227,9 +237,7 @@ impl Game<'_> {
                 .get("environment/celestial/end_flash")
                 .copied()
         {
-            let flash = &self.end.flash;
-            let pose = glam::Mat4::from_rotation_y((180.0 - flash.y_angle).to_radians())
-                * glam::Mat4::from_rotation_x((-90.0 - flash.x_angle).to_radians());
+            let pose = self.end.flash.pose();
             let level = (intensity.clamp(0.0, 1.0) * 255.0) as u32;
             let color = level << 24 | level << 16 | level << 8 | level;
             let corners = [
@@ -251,6 +259,16 @@ impl Game<'_> {
             }
         }
         out
+    }
+
+    /// What a shader pack's `endFlashPosition` and `endFlashIntensity` read: the flash quad's
+    /// centre in the sky's world axes (before the view matrix) and its interpolated intensity.
+    /// Both zero outside the End.
+    pub(super) fn end_flash_for_pack(&self, partial: f32) -> (glam::Vec3, f32) {
+        if self.dim != Dim::End {
+            return (glam::Vec3::ZERO, 0.0);
+        }
+        (self.end.flash.center(), self.end.flash.intensity(partial))
     }
 
     /// LightmapRenderStateExtractor: End flashes add to the sky light factor.
@@ -1243,5 +1261,70 @@ impl Game<'_> {
                 });
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn flash(x_angle: f32, y_angle: f32) -> EndFlash {
+        EndFlash {
+            x_angle,
+            y_angle,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_flash_centre_follows_the_sky_pose() {
+        let close = |a: glam::Vec3, b: glam::Vec3| assert!(a.abs_diff_eq(b, 1e-3), "{a} != {b}");
+        // No turn at all: the quad is built straight up.
+        close(
+            flash(-90.0, 180.0).center(),
+            glam::Vec3::new(0.0, 100.0, 0.0),
+        );
+        // X by 90° tips the top toward +Z; Y by 90° (y_angle 90) then turns +Z to +X.
+        close(
+            flash(-180.0, 180.0).center(),
+            glam::Vec3::new(0.0, 0.0, 100.0),
+        );
+        close(
+            flash(-180.0, 90.0).center(),
+            glam::Vec3::new(100.0, 0.0, 0.0),
+        );
+        // Always 100 blocks out, like the quad's height.
+        assert!((flash(-40.0, -123.0).center().length() - 100.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn the_flash_centre_is_the_middle_of_the_drawn_quad() {
+        // end_flash_geometry transforms (±60, 100, ±60) by the same pose.
+        let f = flash(-35.0, 70.0);
+        let pose = f.pose();
+        let mean = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)]
+            .iter()
+            .map(|&(x, z): &(f32, f32)| {
+                pose.transform_point3(glam::Vec3::new(x * 60.0, 100.0, z * 60.0))
+            })
+            .sum::<glam::Vec3>()
+            / 4.0;
+        assert!(
+            mean.abs_diff_eq(f.center(), 1e-3),
+            "{mean} != {}",
+            f.center()
+        );
+    }
+
+    #[test]
+    fn the_flash_intensity_interpolates_between_ticks() {
+        let f = EndFlash {
+            old_intensity: 0.25,
+            intensity: 0.75,
+            ..Default::default()
+        };
+        assert_eq!(f.intensity(0.0), 0.25);
+        assert_eq!(f.intensity(0.5), 0.5);
+        assert_eq!(f.intensity(1.0), 0.75);
     }
 }

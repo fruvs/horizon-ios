@@ -118,6 +118,8 @@ pub struct LayerRender {
 /// `ItemStackRenderState`.
 #[derive(Clone, Debug)]
 pub struct ItemRenderState {
+    /// The actual top-level stack being rendered, independent of its selected model.
+    pub item: String,
     pub display: DisplayContext,
     pub layers: Vec<LayerRender>,
     pub oversized_in_gui: bool,
@@ -554,6 +556,7 @@ impl ItemRenderer {
             })
             .collect();
         ItemRenderState {
+            item: stack.item.clone(),
             display,
             layers,
             oversized_in_gui: resolved.oversized_in_gui,

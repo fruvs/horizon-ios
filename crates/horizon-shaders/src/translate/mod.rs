@@ -25,7 +25,7 @@ use naga::ShaderStage;
 use naga::front::glsl::{Frontend, Options};
 use naga::valid::{Capabilities, ValidationFlags, Validator};
 
-use crate::Preprocessed;
+use crate::{ImageDefinition, Preprocessed};
 
 mod rewrite;
 mod scan;
@@ -43,6 +43,8 @@ pub struct Interface {
     pub uniforms: Vec<Uniform>,
     /// Each sampler: texture at `binding`, sampler object at `binding + 1`.
     pub samplers: Vec<Sampler>,
+    /// Storage images share set 0, after texture/sampler pairs.
+    pub images: Vec<StorageImage>,
     /// The fragment stage's output locations.
     pub outputs: Vec<u32>,
     /// A gbuffers program reads `DRAW_UNIFORMS`: the block at set 2, binding 0, set per draw.
@@ -50,11 +52,12 @@ pub struct Interface {
 }
 
 /// The uniforms a gbuffers program reads per draw (5.3's "D"), in a block of their own
-/// (`HzDraw`, std140: three ints, a pad, a vec4; 32 bytes) the game sets for each draw.
-pub const DRAW_UNIFORMS: [(&str, &str); 4] = [
+/// (`HzDraw`, std140: four ints and a vec4; 32 bytes) the game sets for each draw.
+pub const DRAW_UNIFORMS: [(&str, &str); 5] = [
     ("renderStage", "int"),
     ("entityId", "int"),
     ("blockEntityId", "int"),
+    ("currentRenderedItemId", "int"),
     ("entityColor", "vec4"),
 ];
 
@@ -72,6 +75,15 @@ pub struct Sampler {
     /// The type the pack declared: `sampler2D`, `sampler2DShadow`, `usampler2D`, `sampler3D`...
     pub ty: String,
     pub binding: u32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct StorageImage {
+    pub name: String,
+    pub ty: String,
+    pub binding: u32,
+    pub format: naga::StorageFormat,
+    pub access: naga::StorageAccess,
 }
 
 /// A program that failed, at a pack file and line.
@@ -97,6 +109,31 @@ pub enum Target {
     Window,
 }
 
+/// Terrain vertex-colour policy selected by the pack's documented rendering settings.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TerrainLighting {
+    pub old_lighting: bool,
+    pub separate_ao: bool,
+    /// Ambient-occlusion strength, from zero to one.
+    pub ao_strength: f32,
+}
+
+impl Default for TerrainLighting {
+    fn default() -> Self {
+        Self {
+            old_lighting: true,
+            separate_ao: false,
+            ao_strength: 1.0,
+        }
+    }
+}
+
+fn terrain_lighting_constants(policy: Option<TerrainLighting>) -> String {
+    policy.map_or_else(String::new, |policy| format!(
+        "const bool hz_old_lighting = {};\nconst bool hz_separate_ao = {};\nconst float hz_ao_strength = {:?};\n",
+        policy.old_lighting, policy.separate_ao, policy.ao_strength))
+}
+
 /// What a gbuffers-style program's vertex stage reads. The game writes it: it knows its vertex
 /// formats, the translator only places it.
 #[derive(Clone, Debug, Default)]
@@ -114,6 +151,9 @@ pub struct GbuffersInputs {
     /// The alpha test applied to output 0 (`gl_FragData[0]`, `gl_FragColor`), the loader's
     /// (3.2 `alphaTest.<program>`): `None` keeps every fragment.
     pub alpha_test: Option<AlphaTest>,
+    /// Opts terrain inputs into pack lighting policy constants. Other vertex formats leave
+    /// this unset, so their colour input is unaffected by terrain-only shading settings.
+    pub terrain_lighting: Option<TerrainLighting>,
 }
 
 /// A fragment stays when its output 0's alpha compares to `reference` as `op` says (a GLSL
@@ -154,7 +194,7 @@ pub fn translate_composite(
     fragment: &Preprocessed,
     target: Target,
 ) -> Result<Program, Vec<Error>> {
-    translate(vertex, fragment, target, None, false)
+    translate_composite_with_images(vertex, fragment, target, &[])
 }
 
 /// Translates a gbuffers-style program (`gbuffers_terrain`...) drawing the game's geometry
@@ -165,7 +205,7 @@ pub fn translate_gbuffers(
     target: Target,
     inputs: &GbuffersInputs,
 ) -> Result<Program, Vec<Error>> {
-    translate(vertex, fragment, target, Some(inputs), false)
+    translate_gbuffers_with_images(vertex, fragment, target, inputs, &[])
 }
 
 /// Translates a shadow program (`shadow`, `shadow_water`...) drawing the game's geometry
@@ -176,7 +216,178 @@ pub fn translate_shadow(
     fragment: &Preprocessed,
     inputs: &GbuffersInputs,
 ) -> Result<Program, Vec<Error>> {
-    translate(vertex, fragment, Target::Buffers, Some(inputs), true)
+    translate_shadow_with_images(vertex, fragment, inputs, &[])
+}
+
+pub fn translate_composite_with_images(
+    vertex: &Preprocessed,
+    fragment: &Preprocessed,
+    target: Target,
+    images: &[ImageDefinition],
+) -> Result<Program, Vec<Error>> {
+    translate(vertex, fragment, target, None, false, images)
+}
+pub fn translate_gbuffers_with_images(
+    vertex: &Preprocessed,
+    fragment: &Preprocessed,
+    target: Target,
+    inputs: &GbuffersInputs,
+    images: &[ImageDefinition],
+) -> Result<Program, Vec<Error>> {
+    translate(vertex, fragment, target, Some(inputs), false, images)
+}
+pub fn translate_shadow_with_images(
+    vertex: &Preprocessed,
+    fragment: &Preprocessed,
+    inputs: &GbuffersInputs,
+    images: &[ImageDefinition],
+) -> Result<Program, Vec<Error>> {
+    translate(
+        vertex,
+        fragment,
+        Target::Buffers,
+        Some(inputs),
+        true,
+        images,
+    )
+}
+
+/// A validated compute stage with the same binding convention as graphics programs.
+pub struct ComputeProgram {
+    pub module: naga::Module,
+    pub interface: Interface,
+}
+
+pub fn translate_compute(
+    source: &Preprocessed,
+    definitions: &[ImageDefinition],
+) -> Result<ComputeProgram, Vec<Error>> {
+    let mut stage = Stage::scan(source, ShaderStage::Compute);
+    if !stage.errors.is_empty() {
+        return Err(std::mem::take(&mut stage.errors));
+    }
+    let uniforms: BTreeMap<String, String> = stage
+        .uniforms
+        .iter()
+        .map(|(n, t, _)| (n.clone(), t.clone()))
+        .collect();
+    let samplers: Vec<Sampler> = stage
+        .samplers
+        .iter()
+        .enumerate()
+        .map(|(i, (name, ty))| Sampler {
+            name: name.clone(),
+            ty: ty.clone(),
+            binding: 1 + 2 * i as u32,
+        })
+        .collect();
+    let mut header = String::from(
+        "#version 450\nlayout(set = 0, binding = 0) uniform HzUniforms { vec4 hz_target; vec4 hz_fog_color; vec4 hz_fog;",
+    );
+    for (name, ty) in &uniforms {
+        match ty.as_str() {
+            "bool" => write!(header, " int hz_bool_{name};"),
+            _ => match ty.split_once('[') {
+                Some((base, size)) => write!(header, " {base} {name}[{size};"),
+                None => write!(header, " {ty} {name};"),
+            },
+        }
+        .unwrap();
+    }
+    header.push_str(" };\n");
+    for sampler in &samplers {
+        let (texture, sampler_ty) = split_sampler(&sampler.ty);
+        writeln!(header, "layout(set=0,binding={}) uniform {texture} {}; layout(set=0,binding={}) uniform {sampler_ty} hz_s_{};",sampler.binding,sampler.name,sampler.binding+1,sampler.name).unwrap();
+    }
+    let mut image_types = BTreeMap::new();
+    for (i, (name, ty, layout_format, memory)) in stage.images.iter().enumerate() {
+        let format = layout_format.as_deref().or_else(|| {
+            definitions
+                .iter()
+                .find(|d| &d.name == name)
+                .map(|d| d.format.as_str())
+        });
+        let Some(format) = format else {
+            return Err(vec![Error {
+                file: "<horizon>".into(),
+                line: 0,
+                message: format!(
+                    "`{name}`: storage image needs a layout format or image.{name} property"
+                ),
+            }]);
+        };
+        let binding = 1 + 2 * samplers.len() as u32 + i as u32;
+        writeln!(
+            header,
+            "layout(set=0,binding={binding},{format}) {memory}uniform {ty} {name};"
+        )
+        .unwrap();
+        image_types.insert(binding, (name.clone(), ty.clone()));
+    }
+    header.push_str(&stage.prelude());
+    let mut text = format!(
+        "{header}{}\nvoid main() {{\n",
+        stage.rewrite(&samplers, &uniforms)
+    );
+    for name in &stage.inits {
+        writeln!(text, "{name} = hz_init_{name}();").unwrap();
+    }
+    text.push_str("hz_main();\n}\n");
+    let (module, used) = compile(&stage, &text, header.lines().count())?;
+    let (uniform_size, offsets) = block_layout(&module);
+    let uniforms = offsets
+        .into_iter()
+        .filter_map(|(member, offset)| {
+            let name = member
+                .strip_prefix("hz_bool_")
+                .unwrap_or(&member)
+                .to_owned();
+            let ty = if name.starts_with("hz_") {
+                "vec4".into()
+            } else {
+                uniforms.get(&name)?.clone()
+            };
+            Some(Uniform { name, ty, offset })
+        })
+        .collect();
+    let mut images = Vec::new();
+    for (_, variable) in module.global_variables.iter() {
+        let Some(binding) = variable
+            .binding
+            .as_ref()
+            .filter(|b| b.group == 0 && used.contains(&b.binding))
+        else {
+            continue;
+        };
+        if let naga::TypeInner::Image {
+            class: naga::ImageClass::Storage { format, access },
+            ..
+        } = module.types[variable.ty].inner
+        {
+            let (name, ty) = image_types.get(&binding.binding).unwrap();
+            images.push(StorageImage {
+                name: name.clone(),
+                ty: ty.clone(),
+                binding: binding.binding,
+                format,
+                access,
+            });
+        }
+    }
+    Ok(ComputeProgram {
+        module,
+        interface: Interface {
+            uniform_size,
+            uniforms,
+            samplers: samplers
+                .into_iter()
+                .filter(|s| used.contains(&s.binding))
+                .collect(),
+            images,
+            outputs: Vec::new(),
+            draw: false,
+        },
+    })
 }
 
 /// The matrices of the compatibility profile in a gbuffers-style program, from the frame's.
@@ -195,6 +406,7 @@ fn translate(
     target: Target,
     gbuffers: Option<&GbuffersInputs>,
     shadow: bool,
+    image_definitions: &[ImageDefinition],
 ) -> Result<Program, Vec<Error>> {
     let matrices = if shadow {
         GBUFFERS_MATRICES.replace("gbuffer", "shadow")
@@ -259,6 +471,40 @@ fn translate(
         })
         .collect();
 
+    let mut image_bindings = BTreeMap::new();
+    for stage in [&v, &f] {
+        for (name, ty, layout_format, _) in &stage.images {
+            let format = layout_format.clone().or_else(|| {
+                image_definitions
+                    .iter()
+                    .find(|d| &d.name == name)
+                    .map(|d| d.format.clone())
+            });
+            let Some(format) = format else {
+                errors.push(Error {
+                    file: "<horizon>".into(),
+                    line: 0,
+                    message: format!(
+                        "`{name}`: storage image needs a layout format or image.{name} property"
+                    ),
+                });
+                continue;
+            };
+            let binding = 1 + 2 * samplers.len() as u32 + image_bindings.len() as u32;
+            if let Some((_, old_ty, old_format)) = image_bindings.get(name) {
+                if old_ty != ty || old_format != &format {
+                    errors.push(Error {
+                        file: "<horizon>".into(),
+                        line: 0,
+                        message: format!("`{name}`: image type or format differs between stages"),
+                    });
+                }
+            } else {
+                image_bindings.insert(name.clone(), (binding, ty.clone(), format));
+            }
+        }
+    }
+
     // Varyings by name: the vertex outputs, then fragment inputs the vertex stage lacks. A
     // matrix or array travels as one varying per column or element (`varying_parts`).
     let mut locations: BTreeMap<String, (u32, String)> = BTreeMap::new();
@@ -287,6 +533,9 @@ fn translate(
 
     let header = |stage: &Stage| {
         let mut h = String::from("#version 450\n");
+        h.push_str(&terrain_lighting_constants(
+            gbuffers.and_then(|inputs| inputs.terrain_lighting),
+        ));
         h.push_str("layout(set = 0, binding = 0) uniform HzUniforms { vec4 hz_target; vec4 hz_fog_color; vec4 hz_fog;");
         for (name, ty) in &uniforms {
             match ty.as_str() {
@@ -302,7 +551,7 @@ fn translate(
         if draw {
             h.push_str(
                 "layout(set = 2, binding = 0) uniform HzDraw { int renderStage; int entityId; \
-                 int blockEntityId; int hz_draw_pad; vec4 entityColor; };\n",
+                 int blockEntityId; int currentRenderedItemId; vec4 entityColor; };\n",
             );
         }
         for s in &samplers {
@@ -313,6 +562,15 @@ fn translate(
                 s.binding, s.name, s.binding + 1, s.name
             )
             .unwrap();
+        }
+        for (name, ty, _, memory) in &stage.images {
+            if let Some((binding, _, format)) = image_bindings.get(name) {
+                writeln!(
+                    h,
+                    "layout(set = 0, binding = {binding}, {format}) {memory}uniform {ty} {name};"
+                )
+                .unwrap();
+            }
         }
         let direction = if stage.kind == ShaderStage::Vertex {
             "out"
@@ -460,6 +718,39 @@ fn translate(
         .into_iter()
         .filter(|sampler| used.contains(&sampler.binding))
         .collect();
+    let mut images: Vec<StorageImage> = Vec::new();
+    for module in [&vertex, &fragment] {
+        for (_, variable) in module.global_variables.iter() {
+            let Some(binding) = variable
+                .binding
+                .as_ref()
+                .filter(|b| b.group == 0 && used.contains(&b.binding))
+            else {
+                continue;
+            };
+            let naga::TypeInner::Image {
+                class: naga::ImageClass::Storage { format, access },
+                ..
+            } = module.types[variable.ty].inner
+            else {
+                continue;
+            };
+            if let Some(existing) = images.iter_mut().find(|i| i.binding == binding.binding) {
+                existing.access |= access;
+            } else if let Some((name, (_, ty, _))) = image_bindings
+                .iter()
+                .find(|(_, (b, _, _))| *b == binding.binding)
+            {
+                images.push(StorageImage {
+                    name: name.clone(),
+                    ty: ty.clone(),
+                    binding: binding.binding,
+                    format,
+                    access,
+                });
+            }
+        }
+    }
     Ok(Program {
         vertex,
         fragment,
@@ -467,6 +758,7 @@ fn translate(
             uniform_size,
             uniforms,
             samplers,
+            images,
             outputs,
             draw,
         },
@@ -621,6 +913,90 @@ mod tests {
     use crate::pack::tests::zip;
     use crate::{Macros, Pack, preprocess};
 
+    #[test]
+    fn terrain_lighting_constants_are_explicit_and_opt_in() {
+        assert!(terrain_lighting_constants(None).is_empty());
+        assert_eq!(
+            TerrainLighting::default(),
+            TerrainLighting {
+                old_lighting: true,
+                separate_ao: false,
+                ao_strength: 1.0
+            }
+        );
+        let policy = TerrainLighting {
+            old_lighting: false,
+            separate_ao: true,
+            ao_strength: 0.375,
+        };
+        let source = terrain_lighting_constants(Some(policy));
+        assert!(source.contains("const bool hz_old_lighting = false;"));
+        assert!(source.contains("const bool hz_separate_ao = true;"));
+        assert!(source.contains("const float hz_ao_strength = 0.375;"));
+        let pack = Pack::from_zip_bytes(
+            "lighting",
+            zip(&[
+                (
+                    "shaders/terrain.vsh",
+                    "#version 120\nvoid main(){gl_Position=gl_Vertex;gl_FrontColor=gl_Color;}",
+                ),
+                (
+                    "shaders/terrain.fsh",
+                    "#version 120\nvoid main(){gl_FragColor=gl_Color;}",
+                ),
+            ]),
+        )
+        .unwrap();
+        let macros = Macros::standard();
+        let vertex = preprocess(&pack, "terrain.vsh", &macros);
+        let fragment = preprocess(&pack, "terrain.fsh", &macros);
+        let inputs = GbuffersInputs {
+            body: "hz_Vertex=vec4(0.0,0.0,0.0,1.0);hz_Color=vec4(hz_old_lighting?1.0:0.0,hz_separate_ao?1.0:0.0,hz_ao_strength,1.0);".into(),
+            terrain_lighting: Some(policy), ..Default::default()
+        };
+        for result in [
+            translate_gbuffers(&vertex, &fragment, Target::Buffers, &inputs),
+            translate_shadow(&vertex, &fragment, &inputs),
+        ] {
+            let program = result.unwrap_or_else(|e| panic!("{e:?}"));
+            for module in [&program.vertex, &program.fragment] {
+                for name in ["hz_old_lighting", "hz_separate_ao", "hz_ao_strength"] {
+                    assert!(
+                        module
+                            .constants
+                            .iter()
+                            .any(|(_, c)| c.name.as_deref() == Some(name)),
+                        "{name}"
+                    );
+                }
+                assert!(
+                    !program
+                        .interface
+                        .uniforms
+                        .iter()
+                        .any(|u| u.name == "hz_ao_strength")
+                );
+            }
+        }
+        let plain = GbuffersInputs {
+            body: "hz_Vertex=vec4(0.0,0.0,0.0,1.0);hz_Color=vec4(1.0);".into(),
+            ..Default::default()
+        };
+        let program = translate_gbuffers(&vertex, &fragment, Target::Buffers, &plain).unwrap();
+        assert!(
+            !program
+                .vertex
+                .constants
+                .iter()
+                .any(|(_, c)| c
+                    .name
+                    .as_deref()
+                    .is_some_and(|name| name.starts_with("hz_old_lighting")
+                        || name.starts_with("hz_separate_ao")
+                        || name.starts_with("hz_ao_strength")))
+        );
+    }
+
     fn program(files: &[(&str, &str)], target: Target) -> Result<Program, Vec<Error>> {
         let files: Vec<(String, &str)> = files
             .iter()
@@ -638,6 +1014,105 @@ mod tests {
 
     const VSH_120: &str = "#version 120\nvarying vec2 texcoord;\nvoid main() {\n    gl_Position = ftransform();\n    \
                            texcoord = (gl_TextureMatrix[0] * gl_MultiTexCoord0).xy;\n}\n";
+
+    #[test]
+    fn opengl_vertex_and_instance_ids_remain_signed_integers() {
+        program(&[("composite.vsh","#version 330\nvoid main(){int vertex=gl_VertexID;int instance=gl_InstanceID;int corner=gl_VertexID & 3;bool earlier=vertex<instance;gl_Position=gl_Vertex+vec4(float(corner),float(vertex-instance),earlier?1.0:0.0,0.0);}"),("composite.fsh","#version 330\nvoid main(){gl_FragColor=vec4(1.0);}")],Target::Buffers).unwrap_or_else(|errors|panic!("{errors:?}"));
+    }
+
+    #[test]
+    fn vertex_and_instance_ids_keep_their_builtin_inputs() {
+        let vertex = "#version 330\nvoid main() { gl_Position = gl_Vertex + vec4(float(gl_VertexID), float(gl_InstanceID), 0.0, 0.0); }\n";
+        let p = program(
+            &[
+                ("composite.vsh", vertex),
+                (
+                    "composite.fsh",
+                    "#version 330\nvoid main() { gl_FragColor = vec4(1.0); }\n",
+                ),
+            ],
+            Target::Buffers,
+        )
+        .unwrap_or_else(|e| panic!("{e:?}"));
+        for builtin in [naga::BuiltIn::VertexIndex, naga::BuiltIn::InstanceIndex] {
+            assert!(
+                p.vertex.entry_points[0]
+                    .function
+                    .arguments
+                    .iter()
+                    .any(|a| { a.binding == Some(naga::Binding::BuiltIn(builtin)) }),
+                "missing {builtin:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn storage_images_compile_with_real_store_and_load_operations() {
+        let p = program(&[("composite.vsh", "#version 450\nlayout(r8ui) writeonly uniform uimage3D voxel;\nvoid main() { imageStore(voxel, ivec3(gl_VertexID, 0, 0), uvec4(3u)); gl_Position = vec4(0.0); }\n"), ("composite.fsh", "#version 450\nlayout(rgba16f) readonly uniform image3D history;\nvoid main() { gl_FragColor = imageLoad(history, ivec3(0)); }\n")], Target::Buffers).unwrap_or_else(|e| panic!("{e:?}"));
+        assert_eq!(p.interface.images.len(), 2);
+        let voxel = p
+            .interface
+            .images
+            .iter()
+            .find(|i| i.name == "voxel")
+            .unwrap();
+        assert_eq!(voxel.format, naga::StorageFormat::R8Uint);
+        assert_eq!(voxel.access, naga::StorageAccess::STORE);
+        let history = p
+            .interface
+            .images
+            .iter()
+            .find(|i| i.name == "history")
+            .unwrap();
+        assert_eq!(history.format, naga::StorageFormat::Rgba16Float);
+        assert_eq!(history.access, naga::StorageAccess::LOAD);
+        assert!(p.vertex.functions.iter().any(|(_, f)| {
+            f.body
+                .iter()
+                .any(|s| matches!(s, naga::Statement::ImageStore { .. }))
+        }));
+    }
+
+    #[test]
+    fn properties_supply_image_format_and_stage_access_is_combined() {
+        let pack = Pack::from_zip_bytes("I.zip", zip(&[
+            ("shaders/p.vsh", "#version 450\nwriteonly uniform uimage3D voxels;\nvoid main() { imageStore(voxels, ivec3(0), uvec4(1u)); gl_Position=vec4(0.0); }\n"),
+            ("shaders/p.fsh", "#version 450\nreadonly uniform uimage3D voxels;\nlayout(rgba8) uniform image2D unusedImage;\nvoid main() { gl_FragColor=vec4(imageLoad(voxels,ivec3(0))); }\n"),
+        ])).unwrap();
+        let macros = Macros::standard();
+        let vertex = preprocess(&pack, "p.vsh", &macros);
+        let fragment = preprocess(&pack, "p.fsh", &macros);
+        assert!(translate_composite(&vertex, &fragment, Target::Buffers).is_err());
+        let images = ImageDefinition::parse(&crate::Properties::parse(
+            "image.voxels=voxelSampler red_integer r8ui unsigned_int true false 16 8 16",
+            &macros,
+        ))
+        .unwrap();
+        let p = translate_composite_with_images(&vertex, &fragment, Target::Buffers, &images)
+            .unwrap_or_else(|e| panic!("{e:?}"));
+        assert_eq!(p.interface.images.len(), 1);
+        assert_eq!(
+            p.interface.images[0].access,
+            naga::StorageAccess::LOAD | naga::StorageAccess::STORE
+        );
+        assert_eq!(p.interface.images[0].format, naga::StorageFormat::R8Uint);
+    }
+
+    #[test]
+    fn compute_translates_storage_writes_and_invocation_builtins() {
+        let pack=Pack::from_zip_bytes("C.zip",zip(&[("shaders/prepare.csh", "#version 430\nlayout(local_size_x=4, local_size_y=2) in;\nlayout(rgba16f) writeonly uniform image3D volume;\nuniform float frameTime;\nvoid main() { imageStore(volume, ivec3(gl_GlobalInvocationID), vec4(frameTime)); }\n")])).unwrap();
+        let pp = preprocess(&pack, "prepare.csh", &Macros::standard());
+        let p = translate_compute(&pp, &[]).unwrap_or_else(|e| panic!("{e:?}"));
+        assert_eq!(p.module.entry_points[0].workgroup_size, [4, 2, 1]);
+        assert_eq!(p.interface.images[0].access, naga::StorageAccess::STORE);
+        assert!(p.interface.uniforms.iter().any(|u| u.name == "frameTime"));
+    }
+
+    #[test]
+    fn unsigned_max_promotes_integer_arguments_and_arrays_may_follow_types() {
+        let vertex = "#version 450\nconst ivec3[2] positions = ivec3[2](ivec3(0), ivec3(1));\nvoid main() { uint id = uint(gl_VertexID); uint value = max(id - 1, 1); uvec3 v = max(uvec3(id), ivec3(1)); gl_Position = vec4(positions[0], 1.0) + vec4(v, value); }\n";
+        program(&[("composite.vsh",vertex),("composite.fsh","#version 450\nvoid main() { gl_FragColor=vec4(max(vec3(0.0),1.0),max(0.0,1.0)); }\n")],Target::Buffers).unwrap_or_else(|e|panic!("{e:?}"));
+    }
 
     #[test]
     fn unused_declared_samplers_are_not_required_inputs() {
@@ -833,6 +1308,65 @@ mod tests {
                 .any(|f| format!("{:?}", f.body).contains("Kill"));
             // With `out` variables the pack tests alpha itself.
             assert_eq!(kill, kills, "{fsh}");
+        }
+    }
+
+    #[test]
+    fn rendered_item_id_uses_the_per_draw_slot_in_geometry_and_shadow() {
+        let pack = Pack::from_zip_bytes("Item.zip", zip(&[
+            ("shaders/items.vsh", "#version 450\nuniform int currentRenderedItemId;\nvoid main() { gl_Position = gl_Vertex + vec4(float(currentRenderedItemId)); }\n"),
+            ("shaders/items.fsh", "#version 450\nuniform int currentRenderedItemId;\nuniform vec4 entityColor;\nvoid main() { gl_FragColor = entityColor + vec4(float(currentRenderedItemId)); }\n"),
+        ])).unwrap();
+        let macros = Macros::standard();
+        let vertex = preprocess(&pack, "items.vsh", &macros);
+        let fragment = preprocess(&pack, "items.fsh", &macros);
+        let inputs = GbuffersInputs {
+            body: "hz_Vertex = vec4(0.0, 0.0, 0.0, 1.0);".into(),
+            ..Default::default()
+        };
+        for p in [
+            translate_gbuffers(&vertex, &fragment, Target::Buffers, &inputs),
+            translate_shadow(&vertex, &fragment, &inputs),
+        ] {
+            let p = p.unwrap_or_else(|e| panic!("{e:?}"));
+            assert!(p.interface.draw);
+            assert!(
+                !p.interface
+                    .uniforms
+                    .iter()
+                    .any(|u| u.name == "currentRenderedItemId")
+            );
+            for module in [&p.vertex, &p.fragment] {
+                let (_, draw) = module
+                    .global_variables
+                    .iter()
+                    .find(|(_, v)| {
+                        v.binding
+                            .as_ref()
+                            .is_some_and(|b| b.group == 2 && b.binding == 0)
+                    })
+                    .unwrap();
+                let naga::TypeInner::Struct { members, span } = &module.types[draw.ty].inner else {
+                    panic!("draw block is not a struct")
+                };
+                assert_eq!(*span, 32);
+                assert_eq!(
+                    members
+                        .iter()
+                        .find(|m| m.name.as_deref() == Some("currentRenderedItemId"))
+                        .unwrap()
+                        .offset,
+                    12
+                );
+                assert_eq!(
+                    members
+                        .iter()
+                        .find(|m| m.name.as_deref() == Some("entityColor"))
+                        .unwrap()
+                        .offset,
+                    16
+                );
+            }
         }
     }
 

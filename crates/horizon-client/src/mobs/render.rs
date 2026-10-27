@@ -987,8 +987,16 @@ pub fn render(
     data: &MobData,
     out: &mut Vec<Vertex>,
 ) {
-    render_with(m, alpha, camera, atlas, light, data, &[], out);
+    let _ = render_with(m, alpha, camera, atlas, light, data, &[], out);
 }
+/// A rendered armor subrange and its actual item (or trim material) identifier.
+#[derive(Clone, Debug)]
+pub struct RenderedItem {
+    pub start: usize,
+    pub end: usize,
+    pub item: String,
+}
+
 /// `render` plus extra layers posed like the body (`HumanoidArmorLayer`:
 /// the armour model's parts copy the body's): (model, texture rect, colour).
 #[allow(clippy::too_many_arguments)]
@@ -999,9 +1007,10 @@ pub fn render_with(
     atlas: Atlas,
     light: u32,
     data: &MobData,
-    extra: &[(&Part, [f32; 4], u32)],
+    extra: &[(&Part, [f32; 4], u32, String)],
     out: &mut Vec<Vertex>,
-) {
+) -> Vec<RenderedItem> {
+    let mut items = Vec::new();
     // The invisibility effect hides the model (a drinking wandering trader);
     // an illusioner shows its four mirror images instead.
     if super::trader::is_invisible(m) {
@@ -1012,10 +1021,10 @@ pub fn render_with(
                 let shifted =
                     camera - glam::DVec3::new(off[0] + w[0], off[1] + w[1], off[2] + w[2]);
                 let base = base_transform(m, alpha, shifted);
-                render_visible(m, alpha, base, atlas, light, data, extra, out);
+                render_visible(m, alpha, base, atlas, light, data, extra, out, &mut items);
             }
         }
-        return;
+        return items;
     }
     render_visible(
         m,
@@ -1026,7 +1035,9 @@ pub fn render_with(
         data,
         extra,
         out,
+        &mut items,
     );
+    items
 }
 /// A mob drawn under `origin` instead of at its position (the spinning mob
 /// of `SpawnerRenderer.submitEntityInSpawner`).
@@ -1038,9 +1049,11 @@ pub fn render_posed(
     light: u32,
     data: &MobData,
     out: &mut Vec<Vertex>,
-) {
+) -> Vec<RenderedItem> {
+    let mut items = Vec::new();
     let base = base_transform_at(m, alpha, origin);
-    render_visible(m, alpha, base, atlas, light, data, &[], out);
+    render_visible(m, alpha, base, atlas, light, data, &[], out, &mut items);
+    items
 }
 #[allow(clippy::too_many_arguments)]
 fn render_visible(
@@ -1050,8 +1063,9 @@ fn render_visible(
     atlas: Atlas,
     light: u32,
     data: &MobData,
-    extra: &[(&Part, [f32; 4], u32)],
+    extra: &[(&Part, [f32; 4], u32, String)],
     out: &mut Vec<Vertex>,
+    items: &mut Vec<RenderedItem>,
 ) {
     let overlay = u32::from(red_overlay(m));
     let s = anim::state(m, alpha);
@@ -1082,8 +1096,14 @@ fn render_visible(
     if !shell_last {
         draw_body(out);
     }
-    for (part, uv, color) in extra {
+    for (part, uv, color, item) in extra {
+        let start = out.len();
         draw(part, base, &poses, *uv, *color, light, overlay, out);
+        items.push(RenderedItem {
+            start,
+            end: out.len(),
+            item: item.clone(),
+        });
     }
     let mut all_layers = layers(m);
     // WardenRenderer: the translucent emissive layers fade with the animations.
@@ -1146,6 +1166,28 @@ fn render_visible(
             overlay,
             out,
         );
+        let armor = armor_slot(&layer.model)
+            .and_then(|slot| match slot {
+                super::gear::HEAD => m.extra.head.as_deref(),
+                super::gear::CHEST => m.extra.chest.as_deref(),
+                super::gear::LEGS => m.extra.legs.as_deref(),
+                super::gear::FEET => m.extra.feet.as_deref(),
+                _ => None,
+            })
+            .or_else(|| {
+                layer
+                    .model
+                    .contains("_armor#")
+                    .then_some(m.extra.head.as_deref())
+                    .flatten()
+            });
+        if let Some(item) = armor {
+            items.push(RenderedItem {
+                start,
+                end: out.len(),
+                item: item.to_owned(),
+            });
+        }
         if layer.full_bright && m.species() != Species::Warden {
             for vertex in &mut out[start..] {
                 vertex.normal = [0; 4];
@@ -1372,7 +1414,7 @@ mod tests {
             for posed in [false, true] {
                 let mut vertices = Vec::new();
                 if posed {
-                    render_posed(
+                    let _ = render_posed(
                         &mob,
                         0.5,
                         glam::Mat4::IDENTITY,

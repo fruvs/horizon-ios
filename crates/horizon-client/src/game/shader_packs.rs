@@ -173,69 +173,69 @@ fn start_parser(key: LoadKey, inputs: horizon_shaders::GameInputs) -> Result<(),
     let path = key.path.clone();
     let dimension = key.dimension;
     let (sender, result) = std::sync::mpsc::channel();
-    let _worker =
-        std::thread::Builder::new()
-            .name("Shader source".into())
-            .stack_size(16 * 1024 * 1024)
-            .spawn(move || {
-                let parsed =
-                    (|| {
-                        let pack = Pack::open(&path).map_err(|error| error.to_string())?;
-                        let macros = Macros::standard();
-                        let properties = Properties::parse(
-                            &pack.read_text("shaders.properties").unwrap_or_default(),
-                            &macros,
-                        );
-                        let mut post = load_post(
-                            &pack,
-                            &dimension_folder(&pack, dimension),
-                            &properties,
-                            &macros,
-                            &inputs,
-                        );
-                        post.notes.extend(properties.notes.iter().map(|note| {
-                            format!("shaders.properties:{}: {}", note.line, note.message)
-                        }));
-                        let ids = BlockIds::parse(&Properties::parse(
-                            &pack.read_text("block.properties").unwrap_or_default(),
-                            &macros,
-                        ));
-                        post.notes.extend(
-                            ids.notes
-                                .iter()
-                                .map(|note| format!("block.properties: {note}")),
-                        );
-                        let entity_text = pack.read_text("entity.properties");
-                        let entity_ids = BlockIds::parse_kind(
-                            &Properties::parse(entity_text.as_deref().unwrap_or_default(), &macros),
-                            "entity",
-                        );
-                        let item_text = pack.read_text("item.properties");
-                        let item_ids = BlockIds::parse_kind(
-                            &Properties::parse(item_text.as_deref().unwrap_or_default(), &macros),
-                            "item",
-                        );
-                        let entity_ids = PackIds {
-                            items: item_ids.plain(),
-                            missing_item: if item_text.is_some() { -1 } else { 0 },
-                            old_hand_light: properties
-                                .get("oldHandLight")
-                                .is_none_or(|value| value.trim() != "false"),
-                            entities: entity_ids.plain(),
-                            missing_entity: if entity_text.is_some() { 65535 } else { 0 },
-                            missing_block: if ids.is_empty() { 0 } else { 65535 },
-                            blocks: ids.clone(),
-                            block_states: RefCell::default(),
-                        };
-                        Ok(ParsedPack {
-                            post,
-                            ids,
-                            entity_ids,
-                        })
-                    })();
-                let _ = sender.send(parsed);
-            })
-            .map_err(|error| format!("Could not start shader parser: {error}"))?;
+    let _worker = std::thread::Builder::new()
+        .name("Shader source".into())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(move || {
+            let parsed = (|| {
+                let pack = Pack::open(&path).map_err(|error| error.to_string())?;
+                let macros = Macros::standard();
+                let properties =
+                    Properties::from_pack(&pack, &dimension_folder(&pack, dimension), &macros)
+                        .in_dimension(dimension);
+                let mut post = load_post(
+                    &pack,
+                    &dimension_folder(&pack, dimension),
+                    &properties,
+                    &macros,
+                    &inputs,
+                );
+                post.notes.extend(
+                    properties
+                        .notes
+                        .iter()
+                        .map(|note| format!("shaders.properties:{}: {}", note.line, note.message)),
+                );
+                let ids = BlockIds::parse(&Properties::parse(
+                    &pack.read_text("block.properties").unwrap_or_default(),
+                    &macros,
+                ));
+                post.notes.extend(
+                    ids.notes
+                        .iter()
+                        .map(|note| format!("block.properties: {note}")),
+                );
+                let entity_text = pack.read_text("entity.properties");
+                let entity_ids = BlockIds::parse_kind(
+                    &Properties::parse(entity_text.as_deref().unwrap_or_default(), &macros),
+                    "entity",
+                );
+                let item_text = pack.read_text("item.properties");
+                let item_ids = BlockIds::parse_kind(
+                    &Properties::parse(item_text.as_deref().unwrap_or_default(), &macros),
+                    "item",
+                );
+                let entity_ids = PackIds {
+                    items: item_ids.plain(),
+                    missing_item: if item_text.is_some() { -1 } else { 0 },
+                    old_hand_light: properties
+                        .get("oldHandLight")
+                        .is_none_or(|value| value.trim() != "false"),
+                    entities: entity_ids.plain(),
+                    missing_entity: if entity_text.is_some() { 65535 } else { 0 },
+                    missing_block: if ids.is_empty() { 0 } else { 65535 },
+                    blocks: ids.clone(),
+                    block_states: RefCell::default(),
+                };
+                Ok(ParsedPack {
+                    post,
+                    ids,
+                    entity_ids,
+                })
+            })();
+            let _ = sender.send(parsed);
+        })
+        .map_err(|error| format!("Could not start shader parser: {error}"))?;
     PENDING_LOAD.with_borrow_mut(|pending| *pending = Some(PendingLoad { key, result }));
     Ok(())
 }
@@ -386,6 +386,7 @@ impl Game<'_> {
             .map(|c| c.biome(at.x, at.y, at.z));
         let (held_items, held_light) = self.held_for_pack();
         let info = biome.map(|b| self.res.biomes().get(b));
+        let (end_flash_position, end_flash_intensity) = self.end_flash_for_pack(partial);
         PackInputs {
             day_time: self.world.day_time,
             rain: lerp(self.world.weather.rain_level),
@@ -409,6 +410,36 @@ impl Game<'_> {
             rainfall: info.map_or(0.0, |b| b.downfall),
             held_items,
             held_light,
+            eye_position: if self.camera_type.first_person() {
+                camera
+            } else {
+                self.player.as_ref().map_or(camera, |p| {
+                    let alpha = self.clock.camera_fraction();
+                    let feet = self.previous_position.lerp(p.position, alpha);
+                    glam::DVec3::new(
+                        feet.x,
+                        feet.y
+                            + f64::from(
+                                self.view.eye_height_old
+                                    + (self.view.eye_height - self.view.eye_height_old)
+                                        * alpha as f32,
+                            ),
+                        feet.z,
+                    )
+                })
+            },
+            player_look: glam::DVec3::from_array(self.forward()).as_vec3(),
+            elytra_flying: self.player.as_ref().is_some_and(|p| p.fall_flying),
+            player_mood: self.ambience.moodiness,
+            // Same cloud plane as clouds::Input::uniform; independent of the Clouds option.
+            cloud_height: if self.dim == Dim::Overworld {
+                192.33
+            } else {
+                f32::NAN
+            },
+            heavy_fog: self.boss_overlay.should_create_world_fog(),
+            end_flash_position,
+            end_flash_intensity,
         }
     }
 
@@ -444,6 +475,37 @@ impl Game<'_> {
 }
 
 impl Game<'_> {
+    /// Resolves the rendered stack, using block IDs for block items as required
+    /// by the shader API. This is unrelated to either currently equipped hand.
+    pub(super) fn rendered_item_id(&self, item: &str) -> i32 {
+        let Some(ids) = &self.pack_ids else { return 0 };
+        if let Some(state) = self.res.items().get(item).and_then(|item| item.block) {
+            return self
+                .pack
+                .assets
+                .registry
+                .state(state)
+                .and_then(|state| {
+                    ids.blocks.id(&state.name, |key| {
+                        state.properties.get(key).map(String::as_str)
+                    })
+                })
+                .unwrap_or(ids.missing_block);
+        }
+        ids.items.get(item).copied().unwrap_or(ids.missing_item)
+    }
+
+    pub(super) fn mark_rendered_item(&self, start: usize, end: usize, item: &str) {
+        if self.pack_ids.is_some() && self.emitting_entity_items.get() {
+            EntitySpan::item_range(
+                &mut self.entity_spans.borrow_mut(),
+                start,
+                end,
+                self.rendered_item_id(item),
+            );
+        }
+    }
+
     /// Starts a span of the entity geometry at vertex `start` for entity type `name`
     /// (`minecraft:zombie`; "" for one the pack cannot name). Nothing without a pack.
     pub(super) fn mark_entity(&self, start: usize, name: &str) {
@@ -539,77 +601,39 @@ impl Game<'_> {
 /// (`block/oak_leaves` for `oak_leaves`), else the id most blocks drawing it share (ties: the
 /// lowest); -1 when no block drawing it has one. y is 1 for the fluid sprites, -1 otherwise.
 fn block_id_table(pack: &super::PackResources, ids: &BlockIds) -> Vec<i32> {
-    use std::collections::{BTreeMap, BTreeSet};
-    let layers = pack
-        .render
-        .sprite_layers
-        .values()
-        .max()
-        .map_or(0, |l| l + 1) as usize;
-    let mut table = vec![-1; layers * 2];
-    if ids.is_empty() {
-        return table;
-    }
-    let registry = pack.assets.registry;
-    let catalog = &pack.render.model_catalog;
-    let sprite = |name: &str| pack.render.sprite_layers.get(name).copied();
-    // (layer, id) -> (a block named like the sprite, the blocks).
-    let mut votes: BTreeMap<(u32, i32), (bool, BTreeSet<&str>)> = BTreeMap::new();
+    state_block_id_table(pack.assets.registry, ids, |id| {
+        pack.context.tables.facts(id).map_or(0, |f| f.emission)
+    })
+}
+/// Exact model/fluid identities and emitted light for each source block state.
+fn state_block_id_table(
+    registry: &horizon_world::registry::BlockRegistry,
+    ids: &BlockIds,
+    emission: impl Fn(horizon_world::registry::BlockStateId) -> u8,
+) -> Vec<i32> {
+    use horizon_world::{
+        fluid::{FluidBlockBindings, FluidKind, FluidState},
+        registry::BlockStateId,
+    };
+    let fluids = FluidBlockBindings::new(registry).ok();
+    let stride = horizon_client::gfx::TERRAIN_STATE_WORDS;
+    let mut table = vec![-1; registry.len() * stride];
     for i in 0..registry.len() {
-        let state_id = horizon_world::registry::BlockStateId(i as u32);
-        let Some(state) = registry.state(state_id) else {
+        let Some(state) = registry.state(BlockStateId(i as u32)) else {
             continue;
         };
-        let Some(id) = ids.id(&state.name, |k| state.properties.get(k).map(String::as_str)) else {
-            continue;
-        };
-        let block = state.name.strip_prefix("minecraft:").unwrap_or(&state.name);
-        let mut vote = |layer: u32| {
-            let named = pack
-                .layer_names
-                .get(&layer)
-                .and_then(|n| n.strip_prefix("block/"))
-                == Some(block);
-            let v = votes.entry((layer, id)).or_default();
-            v.0 |= named;
-            v.1.insert(&state.name);
-        };
-        // Fluids draw from their own sprites.
-        let fluid = match block {
-            "water" => ["water_still", "water_flow"],
-            "lava" => ["lava_still", "lava_flow"],
-            _ => ["", ""],
-        };
-        for f in fluid.iter().filter(|f| !f.is_empty()) {
-            if let Some(l) = sprite(&format!("minecraft:block/{f}")) {
-                vote(l);
-            }
-        }
-        let origin = horizon_core::position::BlockPos::new(0, 0, 0);
-        for (_, model) in catalog.collect(state_id, origin).unwrap_or_default() {
-            for face in &model.faces {
-                vote(face.layer);
-            }
-        }
-    }
-    let mut best: BTreeMap<u32, (bool, usize, i32)> = BTreeMap::new();
-    for ((layer, id), (named, blocks)) in votes {
-        let candidate = (named, blocks.len(), -id);
-        let b = best.entry(layer).or_insert(candidate);
-        if candidate > *b {
-            *b = candidate;
-        }
-    }
-    for (layer, (_, _, id)) in best {
-        if let Some(slot) = table.get_mut(layer as usize * 2) {
-            *slot = -id;
-        }
-    }
-    for f in ["water_still", "water_flow", "lava_still", "lava_flow"] {
-        if let Some(l) = sprite(&format!("minecraft:block/{f}"))
-            && let Some(slot) = table.get_mut(l as usize * 2 + 1)
+        table[stride * i] = ids
+            .id(&state.name, |k| state.properties.get(k).map(String::as_str))
+            .unwrap_or(-1);
+        table[stride * i + 3] = 1;
+        table[stride * i + 4] = i32::from(emission(BlockStateId(i as u32)).min(15));
+        if let (Some(bindings), Ok(fluid)) = (&fluids, FluidState::from_block(state))
+            && fluid.kind() != FluidKind::Empty
+            && let Some(state) = registry.state(bindings.block(fluid))
         {
-            *slot = 1;
+            table[stride * i + 2] = ids
+                .id(&state.name, |k| state.properties.get(k).map(String::as_str))
+                .unwrap_or(-1);
         }
     }
     table
@@ -618,6 +642,58 @@ fn block_id_table(pack: &super::PackResources, ids: &BlockIds) -> Vec<i32> {
 #[cfg(test)]
 mod integration_tests {
     use super::*;
+    #[test]
+    fn block_materials_use_exact_states_and_waterlogged_fluid_identity() {
+        use horizon_world::{chunk::BlockState, nbt::Tag, registry::BlockRegistry};
+        use std::collections::BTreeMap;
+        let mut states = Vec::new();
+        let mut defaults = BTreeMap::new();
+        let mut add = |name: &str, properties: BTreeMap<String, String>| {
+            let id = states.len() as i32;
+            defaults.entry(name.into()).or_insert(Tag::Int(id));
+            states.push(
+                BlockState {
+                    name: name.into(),
+                    properties,
+                }
+                .to_nbt(),
+            );
+        };
+        add(
+            "minecraft:oak_log",
+            BTreeMap::from([("axis".into(), "x".into())]),
+        );
+        add(
+            "minecraft:oak_log",
+            BTreeMap::from([("axis".into(), "y".into())]),
+        );
+        add(
+            "minecraft:oak_stairs",
+            BTreeMap::from([("waterlogged".into(), "true".into())]),
+        );
+        add("minecraft:air", BTreeMap::new());
+        for name in ["minecraft:water", "minecraft:lava"] {
+            for level in 0..16 {
+                add(name, BTreeMap::from([("level".into(), level.to_string())]));
+            }
+        }
+        let registry = BlockRegistry::from_nbt(&Tag::Compound(BTreeMap::from([
+            ("DataVersion".into(), Tag::Int(horizon_world::DATA_VERSION)),
+            ("states".into(), Tag::List(states)),
+            ("defaults".into(), Tag::Compound(defaults)),
+        ])))
+        .unwrap();
+        let ids = BlockIds::parse(&Properties::parse(
+            "block.101=minecraft:oak_log:axis=x\nblock.202=minecraft:oak_log:axis=y\nblock.303=minecraft:water:level=0\nblock.404=minecraft:water:level=7\nblock.505=minecraft:oak_stairs",
+            &Macros::standard(),
+        ));
+        assert!(ids.notes.is_empty(), "{:?}", ids.notes);
+        let table = state_block_id_table(&registry, &ids, |id| if id.0 == 0 { 12 } else { 3 });
+        assert_eq!(table.len(), registry.len() * 5);
+        assert_eq!(&table[..10], &[101, -1, -1, 1, 12, 202, -1, -1, 1, 3]);
+        assert_eq!(&table[10..15], &[505, -1, 303, 1, 3]);
+        assert_eq!(&table[(4 + 7) * 5..(4 + 8) * 5], &[404, -1, 404, 1, 3]);
+    }
     #[test]
     fn failed_native_reload_reports_the_active_previous_programs() {
         record_report("Example.hshader", 0, &["sky".into(), "post".into()], &[]);

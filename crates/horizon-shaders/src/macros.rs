@@ -69,6 +69,12 @@ pub fn render_stage(name: &str) -> u32 {
 }
 
 impl Macros {
+    /// Keeps macros with the same definition in another stage's effective environment.
+    pub(crate) fn retain_shared(&mut self, other: &Self) {
+        self.0
+            .retain(|name, definition| other.0.get(name) == Some(definition));
+    }
+
     /// The standard macros that need no renderer (spec 1.5.1): `MC_VERSION`, this system's
     /// `MC_OS_*`, the GL and GLSL versions Horizon's translation accepts, the render stages and
     /// the host settings at their defaults. The GPU vendor and family arrive with the renderer.

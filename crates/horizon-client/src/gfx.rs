@@ -23,6 +23,8 @@ const CRUMBLING_BLEND: wgpu::BlendState = wgpu::BlendState {
     },
     alpha: wgpu::BlendComponent::REPLACE,
 };
+/// Per block-state shader data: model ID/type, fluid ID/type, emitted light level.
+pub const TERRAIN_STATE_WORDS: usize = 5;
 /// `TerrainVertex` for `vs_terrain`: position, UV, layer, light, colour.
 const PACK_INSTANCE_ATTRIBUTES: [wgpu::VertexAttribute; 1] = wgpu::vertex_attr_array![5=>Float32x4];
 const TERRAIN_ATTRIBUTES: [wgpu::VertexAttribute; 5] =
@@ -80,10 +82,12 @@ mod pack_atlas;
 pub mod pack_draw;
 mod pack_entities;
 mod pack_hand;
+mod pack_images;
 mod pack_loader;
 mod pack_post;
 mod pack_shadow;
 mod pack_sky;
+mod pack_textures;
 mod pack_timing;
 pub mod pack_uniforms;
 mod pack_weather;
@@ -91,6 +95,7 @@ mod page_runs;
 pub mod panorama;
 mod resident;
 mod stars;
+mod terrain_metadata;
 mod timing;
 pub mod translucency;
 pub(crate) mod upload;
@@ -287,6 +292,8 @@ pub struct Frame<'a> {
     pub stars: Option<(Mat4, f32)>,
     /// First-person hand and held item, drawn after clearing depth.
     pub hand: &'a [Vertex],
+    /// Item IDs for each emitted first-person hand range.
+    pub hand_spans: &'a [pack_draw::EntitySpan],
     /// `CameraRenderState.hudFov`: the hand's own field of view
     /// (`GameRenderer.render3dHud`).
     pub hand_fov_degrees: f32,
@@ -483,6 +490,7 @@ pub struct Renderer {
     /// Bumped whenever a column becomes or stops being complete.
     detail_revision: u64,
     arena: arena::Arena,
+    terrain_metadata: terrain_metadata::TerrainMetadata,
     sorted_indices: arena::Arena,
     translucent_sorter: translucency::Sorter,
     translucency_cursor: usize,
@@ -525,8 +533,11 @@ pub struct Renderer {
     /// Whether the window's surface can present scRGB.
     hdr_capable: bool,
     /// The shader pack's post-processing, and the dimension (legacy id) it was loaded for.
-    pack_post: Option<(i32, Option<pack_post::PackPost>)>,
-    pack_compiler: pack_loader::Compiler,
+    // Shader packs contain large inline pipeline tables; keep them off the
+    // main-thread stack even when this optional state is empty.
+    pack_post: Option<(i32, Option<Box<pack_post::PackPost>>)>,
+    // Keep queued shader compilation state off the main-thread stack too.
+    pack_compiler: Box<pack_loader::Compiler>,
     pack_generation: u64,
     shader_context: u64,
     shader_report: Option<(i32, Vec<String>, Vec<String>)>,
@@ -924,7 +935,9 @@ async fn open_device(
                     | wgpu::Features::MAPPABLE_PRIMARY_BUFFERS
                     | wgpu::Features::TEXTURE_FORMAT_16BIT_NORM
                     | wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES
-                    | wgpu::Features::RG11B10UFLOAT_RENDERABLE));
+                    | wgpu::Features::RG11B10UFLOAT_RENDERABLE
+                    | wgpu::Features::VERTEX_WRITABLE_STORAGE
+                    | wgpu::Features::CLEAR_TEXTURE));
         let driver = format!("{} {}", info.driver, info.driver_info);
         startup_step(format_args!(
             "requesting the device (driver {}) with features [{features}] and the adapter's \
@@ -1049,13 +1062,7 @@ impl Renderer {
             )
             .into());
         }
-        let Opened {
-            instance,
-            surface,
-            adapter,
-            device,
-            queue,
-        } = match previous {
+        let opened = match previous {
             // Reload resources on the same device; replacing live Vulkan
             // devices can invalidate the driver's swapchain state on the same
             // window.
@@ -1084,6 +1091,50 @@ impl Renderer {
             }
             None => open_device(&window, offscreen, api, layers).await?,
         };
+        Self::from_opened(
+            window,
+            opened,
+            sprite_pixels,
+            sprite_size,
+            sprite_minimum_size,
+            layers,
+            sprite_mips,
+            animations,
+            hud_atlas,
+            forcefield,
+            panorama_faces,
+            prepared,
+            previous,
+        )
+    }
+
+    // Keep pipeline construction out of the async poll frame: iOS invokes
+    // resource reloads on its fixed-size main-thread stack, with another
+    // renderer still alive in the caller.
+    #[inline(never)]
+    fn from_opened(
+        window: Arc<Window>,
+        opened: Opened,
+        sprite_pixels: &[u8],
+        sprite_size: u32,
+        sprite_minimum_size: u32,
+        layers: u32,
+        sprite_mips: &[crate::mipmap::Settings],
+        animations: &[SpriteAnimation],
+        hud_atlas: (&[u8], u32, u32),
+        forcefield: (&[u8], u32),
+        panorama_faces: &panorama::Faces,
+        prepared: Option<PreparedTextures>,
+        previous: Option<&Self>,
+    ) -> Result<Self> {
+        let Opened {
+            instance,
+            surface,
+            adapter,
+            device,
+            queue,
+        } = opened;
+        let split = sprite_split();
         let info = adapter.get_info();
         crate::graphics::suggest_reduced_far_detail(crate::graphics::lod_capped(&info));
         let size = window.inner_size();
@@ -2330,11 +2381,18 @@ impl Renderer {
         });
         let flat_wanted = flat::wanted(&adapter, &device);
         // Readable as storage where flat draws run: a shader pack's terrain program reads them.
+        let shader_readable = adapter
+            .get_downlevel_capabilities()
+            .flags
+            .contains(wgpu::DownlevelFlags::VERTEX_STORAGE)
+            && device.limits().max_storage_buffers_per_shader_stage >= 3
+            && device.limits().max_storage_buffer_binding_size
+                >= 256 * std::mem::size_of::<TerrainVertex>() as u64;
         let arena = arena::Arena::new(
             &device,
             std::mem::size_of::<TerrainVertex>() as u64,
             1 << 20,
-            flat_wanted,
+            shader_readable,
         );
         // Sections as one index list per frame where multi-draw is emulated.
         let flat = flat_wanted.then(|| {
@@ -2529,6 +2587,7 @@ impl Renderer {
             detail_columns: Default::default(),
             detail_revision: 0,
             arena,
+            terrain_metadata: Default::default(),
             sorted_indices,
             translucent_sorter: translucency::Sorter::default(),
             translucency_cursor: 0,
@@ -2747,7 +2806,12 @@ impl Renderer {
         if on && self.flat.is_none() {
             return Err("flat section draws are off on this device".into());
         }
-        self.flat_on = on;
+        if self.flat_on != on {
+            self.flat_on = on;
+            // Legacy terrain shaders bind different vertex inputs in the two modes.
+            // Cancel stale source/pipeline work as well as the active legacy pack.
+            self.drop_legacy_shader_pack();
+        }
         Ok(())
     }
     /// Whether solid quads facing away from the eye are left out.
@@ -2828,6 +2892,10 @@ impl Renderer {
         }
     }
     fn upload_mesh(&mut self, mesh: &SectionMesh) -> Option<SectionGpu> {
+        debug_assert!(
+            mesh.states_match(),
+            "quad source metadata must match the uploaded geometry"
+        );
         let solid = (mesh.solid.len() / 4) as u32;
         let translucent = (mesh.translucent.len() / 4) as u32;
         if solid + translucent == 0 {
@@ -2870,6 +2938,29 @@ impl Renderer {
             )
         });
         let stride = std::mem::size_of::<TerrainVertex>() as u64;
+        if self.arena.shader_readable() {
+            let states = (0..solid as usize)
+                .map(|q| mesh.solid_state(q))
+                .chain((0..translucent as usize).map(|q| mesh.translucent_state(q)));
+            if !self.terrain_metadata.upload(
+                &self.device,
+                encoder,
+                &mut self.section_uploads,
+                (page, start, self.arena.buffer(page).size() / stride),
+                states,
+            ) {
+                if let (Some(flat), Some(id)) = (&mut self.flat, flat_id) {
+                    flat.remove(id);
+                }
+                if let Some((p, offset)) = sorted_indices {
+                    self.sorted_indices
+                        .release(p, offset, u64::from(translucent) * 6);
+                }
+                self.arena.release(page, start, vertices);
+                return None;
+            }
+        }
+
         for (offset, part) in [(0, &mesh.solid), (mesh.solid.len(), &mesh.translucent)] {
             if !part.is_empty() {
                 let bytes: &[u8] = bytemuck::cast_slice(part);
@@ -2930,6 +3021,17 @@ impl Renderer {
         first: u32,
         count: u32,
     ) {
+        self.draw_sections_with(pass, indirect, base, first, count, &|_, _| {});
+    }
+    fn draw_sections_with(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        indirect: &wgpu::Buffer,
+        base: u32,
+        first: u32,
+        count: u32,
+        bind_page: &dyn Fn(&mut wgpu::RenderPass<'_>, u32),
+    ) {
         let (draws, pages) = (&self.draws[..], &self.draw_pages[..]);
         let (mut i, end) = (first as usize, (first + count) as usize);
         while i < end {
@@ -2938,6 +3040,7 @@ impl Renderer {
                 .iter()
                 .take_while(|&&p| p == (page, index_page))
                 .count();
+            bind_page(pass, page);
             pass.set_vertex_buffer(0, self.arena.buffer(page).slice(..));
             let indices = index_page.map_or(&self.indices, |p| self.sorted_indices.buffer(p));
             pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
@@ -2987,6 +3090,7 @@ impl Renderer {
         self.detail_columns.clear();
         self.detail_revision += 1;
         self.arena.clear();
+        self.terrain_metadata.clear();
         if let Some(flat) = &mut self.flat {
             flat.clear();
         }
@@ -3217,6 +3321,8 @@ impl Renderer {
         self.native = None;
         if let Some(post) = pack.as_ref().filter(|post| !post.complete) {
             let mut notes = post.notes.clone();
+            notes.extend(post.compute.notes.iter().cloned());
+            notes.extend(post.config.notes.iter().cloned());
             notes.push("Pack disabled because required programs or renderer inputs are unavailable. Using normal rendering.".into());
             self.pack_atlas = None;
             self.pack_post = Some((dimension, None));
@@ -3244,6 +3350,7 @@ impl Renderer {
         };
         let flat = self.pack_terrain_flat;
         let world = pack_post::OwnedWorld {
+            adapter: self.adapter.clone(),
             atlas: self
                 .pack_atlas
                 .as_ref()
@@ -3305,11 +3412,14 @@ impl Renderer {
     }
     /// Drops the running shader pack, of either kind.
     pub fn drop_shader_packs(&mut self) {
+        self.drop_legacy_shader_pack();
+        self.native = None;
+    }
+    fn drop_legacy_shader_pack(&mut self) {
         self.pack_generation = self.pack_generation.wrapping_add(1);
         self.pack_compiler.cancel_queued();
         self.shader_report = None;
         self.pack_post = None;
-        self.native = None;
         self.pack_atlas = None;
     }
     /// Runs the sky, material and post stages of one of Horizon's own shader packs from now
@@ -3356,6 +3466,9 @@ impl Renderer {
     }
 
     fn pack_terrain_inputs(&mut self) -> Option<horizon_shaders::GbuffersInputs> {
+        if !self.arena.shader_readable() {
+            return None;
+        }
         if self.pack_atlas.is_none() {
             let mut encoder = self.device.create_command_encoder(&Default::default());
             let layers = self
@@ -3388,7 +3501,7 @@ impl Renderer {
     }
     /// The running shader pack's timer, of either kind.
     fn pass_timer<'a>(
-        pack: &'a mut Option<(i32, Option<pack_post::PackPost>)>,
+        pack: &'a mut Option<(i32, Option<Box<pack_post::PackPost>>)>,
         native: &'a mut Option<native_pack::NativePack>,
     ) -> Option<&'a mut Option<pack_timing::PassTiming>> {
         match (pack, native) {
@@ -3551,6 +3664,8 @@ impl Renderer {
     fn draw_frame(&mut self, frame: &Frame) -> Result<bool> {
         self.poll_shader_compilation();
         self.arena.trim();
+        self.terrain_metadata
+            .retain(|page| self.arena.has_page(page));
         self.sorted_indices.trim();
         if let Some(flat) = &mut self.flat {
             flat.trim(|page| self.arena.has_page(page));
@@ -3790,6 +3905,21 @@ impl Renderer {
                     .filter_map(|(&key, tile)| tile.visible(key, camera, frame.distance, &view)),
             );
             visible_lods.sort_unstable_by_key(|v| (v.distance, v.key));
+        }
+        // Allocate resized pack inputs before deciding which world draws the pack replaces.
+        // On failure, reject it once and let normal rendering draw this same frame.
+        let failed_pack = if let Some((dimension, Some(post))) = &mut self.pack_post {
+            let size = [self.config.width, self.config.height]
+                .map(|v| ((v as f32 * self.world_post.scale).round() as u32).clamp(1, 8192));
+            post.resize(&self.device, size);
+            (!post.complete).then(|| (*dimension, post.notes.clone()))
+        } else {
+            None
+        };
+        if let Some((dimension, notes)) = failed_pack {
+            self.pack_post = Some((dimension, None));
+            self.pack_atlas = None;
+            self.shader_report = Some((dimension, Vec::new(), notes));
         }
         // A shader pack's shadow pass draws the sections in its camera's box, all of them (the
         // occlusion graph follows the eye, not the light), within shadowDistanceRenderMul.
@@ -4930,14 +5060,15 @@ impl Renderer {
             };
             post.set_weather(weather);
             let flat = self.flat.as_ref().filter(|_| flat_frame);
-            let pages: Vec<(u32, wgpu::Buffer)> = match flat {
-                Some(_) if pack_draws_terrain || pack_draws_shadow => self
-                    .arena
-                    .page_buffers()
-                    .map(|(p, b)| (p, b.clone()))
-                    .collect(),
-                _ => Vec::new(),
-            };
+            let pages: Vec<(u32, wgpu::Buffer, wgpu::Buffer)> =
+                if pack_draws_terrain || pack_draws_shadow {
+                    self.arena
+                        .page_buffers()
+                        .map(|(p, b)| (p, b.clone(), self.terrain_metadata.page(p).clone()))
+                        .collect()
+                } else {
+                    Vec::new()
+                };
             let mut terrain =
                 |rp: &mut wgpu::RenderPass<'_>,
                  list: pack_post::TerrainList,
@@ -4973,7 +5104,7 @@ impl Renderer {
                                     (shadow_first + shadow_solid, shadow_translucent)
                                 }
                             };
-                            self.draw_sections(rp, &self.indirect, 0, first, count);
+                            self.draw_sections_with(rp, &self.indirect, 0, first, count, page);
                         }
                     }
                 };
@@ -5411,6 +5542,15 @@ fn frustum(m: Mat4) -> [Vec4; 6] {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn renderer_fits_main_thread_stack_budget() {
+        let bytes = std::mem::size_of::<super::Renderer>();
+        assert!(
+            bytes <= 16 * 1024,
+            "Renderer is {bytes} bytes; large optional shader state must stay on the heap"
+        );
+    }
+
     #[test]
     fn surface_is_8_bit_and_not_srgb() {
         use super::surface_format;

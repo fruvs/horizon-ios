@@ -445,7 +445,7 @@ impl Game<'_> {
         let packed = (u32::from(light >> 4) * 16) | ((u32::from(light & 15) * 16) << 8);
         let atlas = &self.gui.atlas;
         let lookup = |name: &str| atlas.sprites.get(name).map(|r| [r.u0, r.v0, r.u1, r.v1]);
-        horizon_client::mobs::render::render_with(
+        let items = horizon_client::mobs::render::render_with(
             m,
             alpha as f32,
             camera,
@@ -455,6 +455,9 @@ impl Game<'_> {
             &self.player_armor_layers(),
             out,
         );
+        for item in items {
+            self.mark_rendered_item(item.start, item.end, &item.item);
+        }
         self.player_elytra_geometry(m, camera, alpha as f32, packed, out);
         self.spin_attack_geometry(m, camera, alpha as f32, packed, out);
         self.held_item_geometry(m, camera, alpha, packed, true, out);
@@ -501,7 +504,7 @@ impl Game<'_> {
         let atlas = &self.gui.atlas;
         let lookup = |name: &str| atlas.sprites.get(name).map(|r| [r.u0, r.v0, r.u1, r.v1]);
         let mut verts = Vec::new();
-        horizon_client::mobs::render::render_with(
+        let _ = horizon_client::mobs::render::render_with(
             &m,
             1.0,
             camera,
@@ -558,9 +561,13 @@ impl Game<'_> {
         light: u32,
         out: &mut Vec<horizon_client::mesher::Vertex>,
     ) {
-        let Some(asset) = self.armor[1]
-            .as_ref()
-            .and_then(|s| self.res.items().get(&s.item))
+        let Some(stack) = self.armor[1].as_ref() else {
+            return;
+        };
+        let Some(asset) = self
+            .res
+            .items()
+            .get(&stack.item)
             .and_then(|i| i.equip_asset.as_ref())
         else {
             return;
@@ -578,6 +585,7 @@ impl Game<'_> {
         let base = horizon_client::mobs::render::base_transform(m, partial, camera)
             * glam::Mat4::from_translation(glam::Vec3::new(0.0, 0.0, 0.125));
         let angles = m.extra.elytra.angles(partial);
+        let start = out.len();
         horizon_client::mobs::render_model(
             model,
             base,
@@ -597,6 +605,7 @@ impl Game<'_> {
             0,
             out,
         );
+        self.mark_rendered_item(start, out.len(), &stack.item);
     }
     /// `SpinAttackEffectLayer`: Riptide's two boxes turning around a spinning
     /// player (`SpinAttackEffectModel.setupAnim`).

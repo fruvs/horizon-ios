@@ -151,17 +151,20 @@ impl PackAtlas {
                 "layout(set = 1, binding = 0) readonly buffer HzBlockSlots { uint hz_block_slots[]; };\n\
                  layout(set = 1, binding = 1) readonly buffer HzSlotOrigins { vec4 hz_slot_origins[]; };\n",
             );
-            // `mc_Entity` of each sprite layer: id, then 1 for fluids or -1 (the game's table),
-            // and the arena page's vertices (`TerrainVertex`, six words each).
-            declarations.push_str(
-                "layout(set = 3, binding = 0) readonly buffer HzBlockIds { int hz_block_ids[]; };\n\
-                 layout(set = 3, binding = 1) readonly buffer HzVertices { uint hz_vertices[]; };\n",
-            );
             "hz_slot_origins[hz_block_slots[uint(gl_VertexIndex) >> 8u]]"
         } else {
             declarations.push_str("layout(location = 5) in vec4 hz_v_origin;\n");
             "hz_v_origin"
         };
+        declarations.push_str("layout(set = 3, binding = 0) readonly buffer HzBlockIds { int hz_block_ids[]; };\nlayout(set = 3, binding = 1) readonly buffer HzVertices { uint hz_vertices[]; };\nlayout(set = 3, binding = 2) readonly buffer HzQuadStates { uint hz_quad_states[]; };\nvec4 hz_mc_entity; vec3 hz_mid_block; vec2 hz_mid_uv; float hz_emission;\n");
+        declarations.push_str(&format!(
+            "const uint hz_state_words = {}u;\n",
+            super::TERRAIN_STATE_WORDS
+        ));
+        declarations.push_str(&format!(
+            "const uint hz_quad_words = {}u;\n",
+            super::terrain_metadata::WORDS
+        ));
         let [width, height] = self.size();
         let scale = [
             self.sprite as f32 / width as f32,
@@ -185,21 +188,39 @@ impl PackAtlas {
             scale[0], scale[1],
         );
         let mut body = body;
-        if flat {
-            body.push_str(FACE);
+        body.push_str(FACE);
+        body.push_str(r#"    hz_mc_entity=vec4(-1.0,-1.0,0.0,0.0); hz_mid_block=vec3(0.0); hz_emission=0.0;
+    uint hz_meta=(uint(gl_VertexIndex)>>2u)*hz_quad_words;
+    uvec2 hz_source=uvec2(hz_quad_states[hz_meta],hz_quad_states[hz_meta+1u]);
+    if(hz_source.x!=0xffffffffu){
+        vec3 hz_cell_origin=vec3(uvec3(hz_source.y&15u,(hz_source.y>>4u)&15u,(hz_source.y>>8u)&15u));
+        hz_mid_block=(hz_cell_origin+vec3(0.5)-hz_v_pos)*64.0;
+        if(hz_source.x<uint(hz_block_ids.length())/hz_state_words){
+            uint hz_id=hz_state_words*hz_source.x+2u*((hz_source.y>>12u)&1u);
+            hz_mc_entity.xy=vec2(float(hz_block_ids[hz_id]),float(hz_block_ids[hz_id+1u]));
+            hz_emission=float(hz_block_ids[hz_state_words*hz_source.x+4u]);
         }
+        if((hz_source.y&8192u)!=0u){
+            vec4 hz_no_dir=unpackUnorm4x8(hz_quad_states[hz_meta+2u+(uint(gl_VertexIndex)&3u)]);
+            vec4 hz_tint=unpackUnorm4x8(hz_quad_states[hz_meta+6u]);
+            vec4 hz_shaded_tint=unpackUnorm4x8(hz_quad_states[hz_meta+7u]);
+            float hz_ao=mix(1.0,hz_no_dir.a,hz_ao_strength);
+            if(hz_separate_ao){hz_Color=vec4(hz_old_lighting?hz_shaded_tint.rgb:hz_tint.rgb,hz_ao);}
+            else{hz_Color=vec4(hz_old_lighting?mix(hz_shaded_tint.rgb,hz_v_color.rgb,hz_ao_strength):mix(hz_tint.rgb,hz_no_dir.rgb,hz_ao_strength),1.0);}
+        }
+    }
+    vec2 hz_avg_uv=vec2(0.0);
+    for(uint hz_c=0u;hz_c<4u;++hz_c){
+        uint hz_uv_word=hz_vertices[hz_q+hz_c*6u+3u];
+        hz_avg_uv+=clamp(vec2(float(hz_uv_word&65535u),float(hz_uv_word>>16u))*hz_origin.w,0.0,1.0)*0.25;
+    }
+    hz_mid_uv=(hz_cell+hz_avg_uv)*hz_scale;
+"#);
         declarations.push_str("vec2 hz_cell; vec2 hz_scale; vec4 hz_tangent;\n");
-        let entity = if flat {
-            "vec4(float(hz_block_ids[2u * hz_layer]), float(hz_block_ids[2u * hz_layer + 1u]), 0.0, 0.0)"
-        } else {
-            "vec4(-1.0, -1.0, 0.0, 0.0)"
-        };
         let attributes = [
-            ("mc_Entity", entity),
-            (
-                "mc_midTexCoord",
-                "vec4((hz_cell + 0.5) * hz_scale, 0.0, 1.0)",
-            ),
+            ("mc_Entity", "hz_mc_entity"),
+            ("at_midBlock", "vec4(hz_mid_block, hz_emission)"),
+            ("mc_midTexCoord", "vec4(hz_mid_uv, 0.0, 1.0)"),
             ("at_tangent", "hz_tangent"),
             ("vaPosition", "hz_Vertex.xyz"),
             ("vaUV0", "hz_MultiTexCoord0.xy"),
@@ -215,6 +236,7 @@ impl PackAtlas {
                 .map(|&(n, v)| (n.to_owned(), v.to_owned()))
                 .collect(),
             after: String::new(),
+            terrain_lighting: Some(horizon_shaders::TerrainLighting::default()),
             alpha_test: None,
         }
     }

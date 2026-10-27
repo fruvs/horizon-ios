@@ -56,6 +56,10 @@ impl Game<'_> {
         // A shader pack's shadow pass still draws what the camera cannot see.
         if hidden && !(self.pack_shadow_casters.0 && self.hide_spans_from(start, vertices.len())) {
             vertices.truncate(start);
+            horizon_client::gfx::pack_draw::EntitySpan::truncate(
+                &mut self.entity_spans.borrow_mut(),
+                start,
+            );
         }
     }
 }

@@ -76,9 +76,92 @@ impl ChunkGenerator for NoTerrain {
 
 /// A server entity the client tracks (position as last sent).
 struct Tracked {
+    uuid: u128,
+    player_name: Option<String>,
     kind: String,
     position: [f64; 3],
 }
+/// `Entity.getScoreboardName`: player profiles use their name; every other
+/// entity uses its UUID. Display names and tab-list visibility do not change it.
+fn tracked_team<'a>(
+    board: &'a horizon_client::scoreboard::Scoreboard,
+    entity: &Tracked,
+    players: &HashMap<u128, String>,
+) -> Option<&'a horizon_client::scoreboard::Team> {
+    if entity.kind == "minecraft:player" {
+        board.players_team(
+            entity
+                .player_name
+                .as_ref()
+                .or_else(|| players.get(&entity.uuid))?,
+        )
+    } else {
+        board.players_team(&horizon_protocol::crypto::uuid_string(entity.uuid))
+    }
+}
+
+fn apply_remote_team(
+    board: &mut horizon_client::scoreboard::Scoreboard,
+    p: play::SetPlayerTeam,
+) -> Result<()> {
+    use horizon_client::scoreboard::{CollisionRule, Visibility, tag_to_json};
+    // Vanilla ignores non-create packets for an unknown team. In particular,
+    // a late join must not create an orphan score-holder mapping.
+    if p.method != 0 && board.team(&p.name).is_none() {
+        return Ok(());
+    }
+    if p.method == 1 {
+        board.remove_team(&p.name);
+        return Ok(());
+    }
+    if p.method == 0 {
+        board.add_team(&p.name);
+    }
+    if let Some(params) = &p.parameters
+        && let Some(team) = board.team_mut(&p.name)
+    {
+        team.display_name = tag_to_json(&params.display_name);
+        team.prefix = tag_to_json(&params.prefix);
+        team.suffix = tag_to_json(&params.suffix);
+        team.color = params
+            .color
+            .and_then(|c| horizon_client::text::COLORS.get(c as usize))
+            .map(|c| c.1.to_owned());
+        team.allow_friendly_fire = params.options & 1 != 0;
+        team.see_friendly_invisibles = params.options & 2 != 0;
+        team.nametag_visibility = Visibility::ALL
+            .get(params.name_tag_visibility as usize)
+            .copied()
+            .unwrap_or(Visibility::Always);
+        team.collision_rule = CollisionRule::ALL
+            .get(params.collision_rule as usize)
+            .copied()
+            .unwrap_or(CollisionRule::Always);
+    }
+    match p.method {
+        0 | 3 => {
+            for player in &p.players {
+                board.add_to_team(player, &p.name);
+            }
+        }
+        4 => {
+            for player in &p.players {
+                // Scoreboard.removePlayerFromTeam(player, team) rejects a
+                // mismatched team before changing the player's current one.
+                if !board
+                    .players_team(player)
+                    .is_some_and(|team| team.name == p.name)
+                {
+                    return Err(format!("Player {player} is not on team {}", p.name).into());
+                }
+                board.remove_from_team(player);
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 /// Smooth an entity toward a new position over three ticks (InterpolationHandler).
 #[derive(Clone, Copy)]
 /// `LinearInterpolationHandler`'s target: a position and rotation (yRot,
@@ -1264,7 +1347,18 @@ impl Game<'_> {
     }
     /// `recreateFromPacket`: yRot and xRot from the packet, the body and head
     /// both at its head yaw (LivingEntity).
-    fn spawn_entity(&mut self, id: i32, kind: &str, position: [f64; 3], rotation: [f32; 3]) {
+    fn spawn_entity(
+        &mut self,
+        id: i32,
+        uuid: u128,
+        kind: &str,
+        position: [f64; 3],
+        rotation: [f32; 3],
+    ) {
+        // ClientLevel.addEntity discards the old entity at this ID first.
+        // Its interpolation, pending item data and passenger state belong to
+        // that old instance and cannot leak into the newly spawned one.
+        self.remove_entity(id);
         let [yaw, pitch, head] = rotation;
         let at = Vec3::new(position[0], position[1], position[2]);
         let mob_type = if kind == "minecraft:player" {
@@ -1309,6 +1403,10 @@ impl Game<'_> {
             r.entities.insert(
                 id,
                 Tracked {
+                    uuid,
+                    player_name: (kind == "minecraft:player")
+                        .then(|| r.players.get(&uuid).cloned())
+                        .flatten(),
                     kind: kind.to_owned(),
                     position,
                 },
@@ -1780,7 +1878,7 @@ impl Game<'_> {
                         r.level_players.remove(&p.id);
                     }
                 }
-                self.spawn_entity(p.id, &kind, p.position, rotation);
+                self.spawn_entity(p.id, p.uuid, &kind, p.position, rotation);
                 // Entity.recreateFromPacket: setDeltaMovement(packet.getMovement()).
                 self.remote_motion(p.id, p.velocity);
                 if !self.spawn_remote_object(p.id, &kind, p.position, rotation[0], p.data) {
@@ -2635,7 +2733,7 @@ impl Game<'_> {
                 Some(o) => self.score.board.reset_one(&p.owner, o),
                 None => self.score.board.reset_all(&p.owner),
             },
-            C::SetPlayerTeam(p) => self.remote_team(p),
+            C::SetPlayerTeam(p) => self.remote_team(p)?,
             C::SetChunkCacheRadius(p) => {
                 self.streaming.radius = self.settings.render_distance.min(p.distance + 1).max(2);
                 if let Some(r) = self.remote.as_mut() {
@@ -2759,50 +2857,8 @@ impl Game<'_> {
         }
     }
     /// `handleSetPlayerTeamPacket`.
-    fn remote_team(&mut self, p: play::SetPlayerTeam) {
-        use horizon_client::scoreboard::{CollisionRule, Visibility, tag_to_json};
-        let board = &mut self.score.board;
-        if p.method == 1 {
-            board.remove_team(&p.name);
-            return;
-        }
-        if p.method == 0 {
-            board.add_team(&p.name);
-        }
-        if let Some(params) = &p.parameters
-            && let Some(team) = board.team_mut(&p.name)
-        {
-            team.display_name = tag_to_json(&params.display_name);
-            team.prefix = tag_to_json(&params.prefix);
-            team.suffix = tag_to_json(&params.suffix);
-            team.color = params
-                .color
-                .and_then(|c| horizon_client::text::COLORS.get(c as usize))
-                .map(|c| c.1.to_owned());
-            team.allow_friendly_fire = params.options & 1 != 0;
-            team.see_friendly_invisibles = params.options & 2 != 0;
-            team.nametag_visibility = Visibility::ALL
-                .get(params.name_tag_visibility as usize)
-                .copied()
-                .unwrap_or(Visibility::Always);
-            team.collision_rule = CollisionRule::ALL
-                .get(params.collision_rule as usize)
-                .copied()
-                .unwrap_or(CollisionRule::Always);
-        }
-        match p.method {
-            0 | 3 => {
-                for player in &p.players {
-                    board.add_to_team(player, &p.name);
-                }
-            }
-            4 => {
-                for player in &p.players {
-                    board.remove_from_team(player);
-                }
-            }
-            _ => {}
-        }
+    fn remote_team(&mut self, p: play::SetPlayerTeam) -> Result<()> {
+        apply_remote_team(&mut self.score.board, p)
     }
     /// The player list's view of the connection: the listed players (with
     /// their downloaded skins once ready), online mode, and which players
@@ -5683,6 +5739,14 @@ impl Remote {
     pub(super) fn profile(&self) -> u128 {
         self.profile
     }
+    /// Team lookup for a server entity, using the identity sent in AddEntity.
+    pub(super) fn entity_team<'a>(
+        &self,
+        board: &'a horizon_client::scoreboard::Scoreboard,
+        id: u32,
+    ) -> Option<&'a horizon_client::scoreboard::Team> {
+        tracked_team(board, self.entities.get(&(id as i32))?, &self.players)
+    }
     /// The entity id of a player in the level, by profile UUID.
     pub(super) fn player_entity(&self, uuid: u128) -> Option<u32> {
         self.level_players
@@ -5695,6 +5759,175 @@ impl Remote {
 #[cfg(test)]
 mod tests {
     use super::Game;
+
+    #[test]
+    fn remote_team_packets_control_pushes_using_profile_names_and_entity_uuids() {
+        use super::{Tracked, apply_remote_team, tracked_team};
+        use horizon_client::scoreboard::{CollisionRule, Scoreboard, pushable_by};
+        use horizon_protocol::{
+            buf::{Codec, Reader, Writer},
+            packets::play,
+        };
+        use horizon_world::nbt::Tag;
+        use std::collections::HashMap;
+
+        fn packet(board: &mut Scoreboard, method: i8, rule: CollisionRule, members: Vec<String>) {
+            let p = play::SetPlayerTeam {
+                name: "server-team".into(),
+                method,
+                parameters: matches!(method, 0 | 2).then(|| play::TeamParameters {
+                    display_name: Tag::String("Display name is not a score holder".into()),
+                    prefix: Tag::String("[rank] ".into()),
+                    suffix: Tag::String("".into()),
+                    name_tag_visibility: 0,
+                    collision_rule: CollisionRule::ALL.iter().position(|r| *r == rule).unwrap()
+                        as i32,
+                    color: None,
+                    options: 3,
+                }),
+                players: members,
+            };
+            let mut bytes = Writer::new();
+            <play::SetPlayerTeam as Codec<play::SetPlayerTeam>>::write(&p, &mut bytes);
+            let decoded = <play::SetPlayerTeam as Codec<play::SetPlayerTeam>>::read(
+                &mut Reader::new(&bytes.data),
+            )
+            .unwrap();
+            apply_remote_team(board, decoded).unwrap();
+        }
+        let uuid = 0x123456789abcdef0123456789abcdef0;
+        let entity = Tracked {
+            uuid,
+            player_name: Some("OtherProfile".into()),
+            kind: "minecraft:player".into(),
+            position: [0.0; 3],
+        };
+        // PlayerInfoRemove (e.g. an NPC removed from the tab list) must not
+        // change the immutable profile of an entity still in the level.
+        let players = HashMap::new();
+        let mut board = Scoreboard::default();
+        packet(
+            &mut board,
+            0,
+            CollisionRule::Never,
+            vec!["OtherProfile".into()],
+        );
+        assert!(!pushable_by(
+            tracked_team(&board, &entity, &players),
+            None,
+            true
+        ));
+        // Updating only the rule takes effect immediately, without respawning.
+        packet(&mut board, 2, CollisionRule::Always, vec![]);
+        assert!(pushable_by(
+            tracked_team(&board, &entity, &players),
+            None,
+            true
+        ));
+        packet(&mut board, 2, CollisionRule::PushOtherTeams, vec![]);
+        assert!(!pushable_by(
+            tracked_team(&board, &entity, &players),
+            None,
+            true
+        ));
+        packet(
+            &mut board,
+            3,
+            CollisionRule::Always,
+            vec!["LocalProfile".into()],
+        );
+        assert!(pushable_by(
+            tracked_team(&board, &entity, &players),
+            board.players_team("LocalProfile"),
+            true
+        ));
+        packet(&mut board, 2, CollisionRule::PushOwnTeam, vec![]);
+        assert!(!pushable_by(
+            tracked_team(&board, &entity, &players),
+            board.players_team("LocalProfile"),
+            true
+        ));
+        assert!(pushable_by(
+            tracked_team(&board, &entity, &players),
+            None,
+            true
+        ));
+        packet(
+            &mut board,
+            4,
+            CollisionRule::Always,
+            vec!["OtherProfile".into()],
+        );
+        assert!(tracked_team(&board, &entity, &players).is_none());
+        // Non-player entities use the AddEntity UUID, never a profile name.
+        let mob = Tracked {
+            kind: "minecraft:zombie".into(),
+            player_name: None,
+            ..entity
+        };
+        packet(
+            &mut board,
+            3,
+            CollisionRule::Always,
+            vec![horizon_protocol::crypto::uuid_string(uuid)],
+        );
+        assert!(tracked_team(&board, &mob, &players).is_some());
+        packet(&mut board, 1, CollisionRule::Always, vec![]);
+        assert!(tracked_team(&board, &mob, &players).is_none());
+        // Servers may disable pushing on the local player's team alone.
+        packet(
+            &mut board,
+            0,
+            CollisionRule::Never,
+            vec!["LocalProfile".into()],
+        );
+        assert!(!pushable_by(None, board.players_team("LocalProfile"), true));
+    }
+
+    #[test]
+    fn remote_team_unknown_packets_and_stale_removals_cannot_strip_current_team() {
+        use super::apply_remote_team;
+        use horizon_client::scoreboard::{CollisionRule, Scoreboard};
+        use horizon_protocol::packets::play::SetPlayerTeam;
+
+        fn packet(name: &str, method: i8) -> SetPlayerTeam {
+            SetPlayerTeam {
+                name: name.into(),
+                method,
+                parameters: None,
+                players: vec!["Profile".into()],
+            }
+        }
+        let mut board = Scoreboard::default();
+        board.add_team("old");
+        board.add_team("current").collision_rule = CollisionRule::Never;
+        board.add_to_team("Profile", "old");
+        apply_remote_team(&mut board, packet("current", 3)).unwrap();
+        // The team-qualified vanilla removal throws for a stale known team.
+        assert!(apply_remote_team(&mut board, packet("old", 4)).is_err());
+        assert_eq!(board.players_team("Profile").unwrap().name, "current");
+        for method in [1, 2, 3, 4] {
+            apply_remote_team(&mut board, packet("unknown", method)).unwrap();
+            assert_eq!(board.players_team("Profile").unwrap().name, "current");
+        }
+        board.add_team("unknown");
+        assert!(board.team("unknown").unwrap().players.is_empty());
+        apply_remote_team(&mut board, packet("old", 1)).unwrap();
+        // A delayed old-team removal is ignored once that team no longer exists.
+        apply_remote_team(&mut board, packet("old", 4)).unwrap();
+        assert_eq!(
+            board.players_team("Profile").unwrap().collision_rule,
+            CollisionRule::Never
+        );
+        // Duplicate creation reuses an existing team, retaining its members.
+        apply_remote_team(&mut board, packet("current", 0)).unwrap();
+        assert_eq!(board.players_team("Profile").unwrap().name, "current");
+        apply_remote_team(&mut board, packet("current", 4)).unwrap();
+        assert!(apply_remote_team(&mut board, packet("current", 4)).is_err());
+        assert!(board.players_team("Profile").is_none());
+        apply_remote_team(&mut board, packet("current", 1)).unwrap();
+        apply_remote_team(&mut board, packet("current", 1)).unwrap();
+    }
 
     #[test]
     fn placement_preview_checks_obstruction_without_changing_the_level() {

@@ -149,7 +149,6 @@ const PAGES: Ty = Ty::Enum(&[
     "extras",
     "horizon",
     "agent",
-    "shader-packs",
 ]);
 
 /// `--confirm`, required by destructive commands: the player agreed.
@@ -797,6 +796,24 @@ mod tests {
                 .unwrap_err()
                 .contains("seed")
         );
+    }
+
+    #[test]
+    fn command_schema_enum_choices_are_unique() {
+        for command in COMMANDS {
+            for parameter in command.params {
+                if let Ty::Enum(choices) = parameter.ty {
+                    let unique: std::collections::BTreeSet<_> = choices.iter().collect();
+                    assert_eq!(
+                        unique.len(),
+                        choices.len(),
+                        "duplicate choice in {}.{}",
+                        command.name,
+                        parameter.name
+                    );
+                }
+            }
+        }
     }
 
     #[test]

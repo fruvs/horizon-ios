@@ -19,7 +19,8 @@ pub(super) struct Request {
 pub(super) struct Finished {
     pub generation: u64,
     pub dimension: i32,
-    pub post: Option<PackPost>,
+    // The result crosses onto the fixed-size main-thread render stack.
+    pub post: Option<Box<PackPost>>,
     pub programs: Vec<String>,
     pub notes: Vec<String>,
 }
@@ -91,7 +92,7 @@ impl Compiler {
                 };
                 let post = if post.complete && !programs.is_empty() && !stop.load(Ordering::Relaxed)
                 {
-                    Some(post)
+                    Some(Box::new(post))
                 } else {
                     notes.push(
                         "Shader pipeline could not load completely. Using normal rendering.".into(),
@@ -155,6 +156,15 @@ impl Drop for Compiler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finished_shader_result_fits_main_thread_stack_budget() {
+        let bytes = std::mem::size_of::<Finished>();
+        assert!(
+            bytes <= 512,
+            "Finished is {bytes} bytes; shader pipeline tables must cross threads on the heap"
+        );
+    }
     #[test]
     fn worker_results_are_polled_and_failures_settle_once() {
         let (send, result) = mpsc::channel();

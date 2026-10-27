@@ -14,10 +14,12 @@
 
 mod biomes;
 mod block_ids;
+mod compute;
 mod condition;
 mod config;
 mod custom;
 mod discover;
+mod images;
 mod lang;
 mod macros;
 mod options;
@@ -25,14 +27,19 @@ mod pack;
 mod post;
 mod preprocess;
 mod properties;
+mod textures;
 mod translate;
 
 pub use biomes::{category as biome_category, precipitation as biome_precipitation};
 pub use block_ids::BlockIds;
+pub use compute::{
+    Compute, ComputeDispatch, ComputeGroup, LoadedCompute, WorkGroups, load_compute,
+};
 pub use condition::eval_condition;
 pub use config::{BUFFERS, Buffer, Config, Format, Kind, Shadow, buffer_index, draw_buffers};
 pub use custom::{Custom, Val};
 pub use discover::{Found, discover};
+pub use images::ImageDefinition;
 pub use lang::Lang;
 pub use macros::{MC_VERSION, Macros, RENDER_STAGES, render_stage};
 pub use options::switches_on;
@@ -43,7 +50,10 @@ pub use post::{
 };
 pub use preprocess::{Diagnostic, Origin, Preprocessed, preprocess};
 pub use properties::{Entry, Note, Properties};
+pub use textures::TextureDefinition;
 pub use translate::{
-    AlphaTest, DRAW_UNIFORMS, Error, GbuffersInputs, Interface, Program, Sampler, Target, Uniform,
-    translate_composite, translate_gbuffers, translate_shadow,
+    AlphaTest, ComputeProgram, DRAW_UNIFORMS, Error, GbuffersInputs, Interface, Program, Sampler,
+    StorageImage, Target, TerrainLighting, Uniform, translate_composite,
+    translate_composite_with_images, translate_compute, translate_gbuffers,
+    translate_gbuffers_with_images, translate_shadow, translate_shadow_with_images,
 };

@@ -578,6 +578,23 @@ impl Game<'_> {
         Ok(())
     }
 
+    /// Committed software-keyboard text; only the focused, interactive field receives it.
+    pub(super) fn dialog_text(&mut self, text: &str) {
+        if self.dialogs.warning || self.dialogs.waiting.is_some() {
+            return;
+        }
+        let Some(open) = self.dialogs.open.as_mut() else {
+            return;
+        };
+        let Some(Some(edit)) = open.focus.and_then(|i| open.fields.get_mut(i)) else {
+            return;
+        };
+        let text: String = text.chars().filter(|c| !c.is_control()).collect();
+        if !text.is_empty() {
+            edit.insert_text(&text);
+        }
+    }
+
     /// `type TEXT` with a dialog open: into the focused text input, or the
     /// first one.
     pub(super) fn dialog_type(&mut self, text: &str) -> bool {

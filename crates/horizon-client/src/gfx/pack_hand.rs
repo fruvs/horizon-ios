@@ -5,6 +5,7 @@
 use glam::Mat4;
 
 use super::Vertex;
+use super::pack_draw::EntitySpan;
 
 /// `MC_HAND_DEPTH`'s value (1.5): the hand's depth is scaled by it through its projection, so
 /// that it sits in front of the world in the shared depth buffer.
@@ -37,6 +38,11 @@ pub fn projection(hud_fov: f32, aspect: f32, far: f32, bob: Mat4) -> Mat4 {
 
 /// The hand's vertices (also read at set 1 for normals and tangents), its uniform and quad
 /// indices.
+pub struct HandDraw {
+    pub indices: std::ops::Range<u32>,
+    pub offset: u32,
+}
+
 pub struct PackHand {
     pub layout: wgpu::BindGroupLayout,
     vertices: wgpu::Buffer,
@@ -46,6 +52,11 @@ pub struct PackHand {
     capacity: u32,
     /// Quads uploaded this frame.
     pub quads: u32,
+    pub draws: Vec<HandDraw>,
+    pub draw_group: Option<wgpu::BindGroup>,
+    draw_buffer: Option<wgpu::Buffer>,
+    draw_capacity: usize,
+    draw_stride: u64,
 }
 
 impl PackHand {
@@ -83,6 +94,13 @@ impl PackHand {
             group,
             capacity,
             quads: 0,
+            draws: Vec::new(),
+            draw_group: None,
+            draw_buffer: None,
+            draw_capacity: 0,
+            draw_stride: 32.max(u64::from(
+                device.limits().min_uniform_buffer_offset_alignment,
+            )),
         }
     }
 
@@ -123,8 +141,11 @@ impl PackHand {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         hand: &[Vertex],
+        spans: &[EntitySpan],
+        draw_layout: &wgpu::BindGroupLayout,
         projection: Mat4,
     ) {
+        self.draws.clear();
         self.quads = (hand.len() / 4) as u32;
         if self.quads == 0 {
             return;
@@ -134,6 +155,30 @@ impl PackHand {
             (self.vertices, self.group) =
                 Self::vertex_buffer(device, &self.layout, &self.uniform, self.capacity);
             self.indices = super::pack_entities::quad_indices(device, self.capacity);
+        }
+        let runs = item_draws(hand.len(), spans);
+        if runs.len() > self.draw_capacity {
+            self.draw_capacity = runs.len().next_power_of_two();
+            let (buffer, group) = super::pack_entities::PackEntities::slot_buffer(
+                device,
+                draw_layout,
+                self.draw_capacity as u64,
+                self.draw_stride,
+            );
+            self.draw_buffer = Some(buffer);
+            self.draw_group = Some(group);
+        }
+        let mut bytes = vec![0u8; runs.len() * self.draw_stride as usize];
+        for (i, (span, range)) in runs.into_iter().enumerate() {
+            let offset = i * self.draw_stride as usize;
+            bytes[offset..offset + 32].copy_from_slice(&span.draw_bytes([0.0; 4]));
+            self.draws.push(HandDraw {
+                indices: range,
+                offset: offset as u32,
+            });
+        }
+        if let Some(buffer) = &self.draw_buffer {
+            queue.write_buffer(buffer, 0, &bytes);
         }
         queue.write_buffer(&self.vertices, 0, bytemuck::cast_slice(hand));
         let matrices = [projection, projection.inverse()].map(|m| m.to_cols_array());
@@ -145,9 +190,58 @@ impl PackHand {
     }
 }
 
+/// First-person subdraws use their own actual stack IDs. Ranges are index-buffer
+/// ranges over the original hand buffer, so splitting never duplicates geometry.
+fn item_draws(len: usize, spans: &[EntitySpan]) -> Vec<(EntitySpan, std::ops::Range<u32>)> {
+    let fallback = [EntitySpan {
+        stage: horizon_shaders::render_stage("HAND_SOLID"),
+        ..Default::default()
+    }];
+    let spans = if spans.is_empty() {
+        &fallback[..]
+    } else {
+        spans
+    };
+    super::pack_entities::runs(len, spans)
+        .filter(|(_, range)| !range.is_empty())
+        .map(|(span, range)| {
+            (
+                span,
+                (range.start as u32 / 4 * 6)..(range.end as u32 / 4 * 6),
+            )
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn separate_hands_keep_distinct_item_ids_and_cover_each_index_once() {
+        let spans = [
+            EntitySpan {
+                start: 0,
+                item_id: 42,
+                ..Default::default()
+            },
+            EntitySpan {
+                start: 8,
+                item_id: 81,
+                ..Default::default()
+            },
+        ];
+        let draws = item_draws(12, &spans);
+        assert_eq!(
+            draws
+                .iter()
+                .map(|(span, range)| (span.item_id, range.clone()))
+                .collect::<Vec<_>>(),
+            [(42, 0..12), (81, 12..18)]
+        );
+        assert_eq!(item_draws(8, &[])[0].1, 0..12);
+        assert!(item_draws(0, &[]).is_empty());
+    }
 
     /// The hand's window depth lies within `MC_HAND_DEPTH` of the middle (packs tell the hand
     /// apart by it), and x, y match the plain projection.

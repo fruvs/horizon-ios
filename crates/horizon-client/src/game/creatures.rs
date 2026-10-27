@@ -3477,7 +3477,7 @@ impl Game<'_> {
             } else {
                 Vec::new()
             };
-            horizon_client::mobs::render::render_with(
+            let items = horizon_client::mobs::render::render_with(
                 mob,
                 alpha as f32,
                 camera,
@@ -3487,6 +3487,9 @@ impl Game<'_> {
                 &armor,
                 out,
             );
+            for item in items {
+                self.mark_rendered_item(item.start, item.end, &item.item);
+            }
             self.mob_block_geometry(mob, camera, alpha, packed, out);
             // Entity.isCurrentlyGlowing: its shape again, in its team's colour, for the outline pass
             // (OutlineBufferSource). Unlit (normal w 0), so the colour is the colour.

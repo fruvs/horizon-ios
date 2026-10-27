@@ -20,6 +20,51 @@ impl Stage<'_> {
              struct hz_FogParameters { vec4 color; float density; float start; float end; float scale; };\n\
              hz_FogParameters hz_Fog;\n",
         );
+        // Naga's built-in overload resolver cannot choose max(uint, int), although
+        // GLSL promotes the integer to uint. Explicit forwarding overloads retain
+        // the standard scalar/vector signatures and resolve that promotion exactly.
+        for (scalar, prefix) in [("float", "vec"), ("int", "ivec"), ("uint", "uvec")] {
+            writeln!(
+                p,
+                "{scalar} hz_max({scalar} x, {scalar} y) {{ return max(x, y); }}"
+            )
+            .unwrap();
+            for n in 2..=4 {
+                writeln!(
+                    p,
+                    "{prefix}{n} hz_max({prefix}{n} x, {prefix}{n} y) {{ return max(x, y); }}"
+                )
+                .unwrap();
+                writeln!(
+                    p,
+                    "{prefix}{n} hz_max({prefix}{n} x, {scalar} y) {{ return max(x, y); }}"
+                )
+                .unwrap();
+            }
+        }
+        p.push_str("uint hz_max(uint x, int y) { return max(x, uint(y)); }\nuint hz_max(int x, uint y) { return max(uint(x), y); }\n");
+        for n in 2..=4 {
+            writeln!(
+                p,
+                "uvec{n} hz_max(uvec{n} x, int y) {{ return max(x, uint(y)); }}"
+            )
+            .unwrap();
+            writeln!(
+                p,
+                "uvec{n} hz_max(uvec{n} x, ivec{n} y) {{ return max(x, uvec{n}(y)); }}"
+            )
+            .unwrap();
+            writeln!(
+                p,
+                "uvec{n} hz_max(ivec{n} x, uvec{n} y) {{ return max(uvec{n}(x), y); }}"
+            )
+            .unwrap();
+            writeln!(
+                p,
+                "uvec{n} hz_max(ivec{n} x, uint y) {{ return max(uvec{n}(x), y); }}"
+            )
+            .unwrap();
+        }
         if self.gbuffers {
             // Set by our `main` from the frame's matrices (gbuffers.rs).
             p.push_str(
@@ -199,6 +244,7 @@ impl Stage<'_> {
                 }
                 // GLSL's `modf`, which naga's frontend lacks.
                 "modf" if called => Some("hz_modf".into()),
+                "max" if called => Some("hz_max".into()),
                 "texture2D" | "texture1D" | "texture3D" | "textureCube" if called => {
                     Some("texture".into())
                 }
@@ -234,14 +280,17 @@ impl Stage<'_> {
                 "gl_FragCoord" => Some("hz_FragCoord".into()),
                 "gl_FrontColor" => Some("hz_FrontColor".into()),
                 "gl_Fog" => Some("hz_Fog".into()),
+                // `gl_VertexID` shares the compatibility input's `gl_Vertex` prefix.
+                // Handle the core built-ins before that family, or they become private
+                // globals that have never been declared (`hz_VertexID`).
+                "gl_VertexID" => Some("int(gl_VertexIndex)".into()),
+                "gl_InstanceID" => Some("int(gl_InstanceIndex)".into()),
                 _ if UNIFORM_STATE.iter().any(|b| t.starts_with(b)) => {
                     Some(format!("hz_{}", &t[3..]))
                 }
                 _ if !fragment && VERTEX_INPUTS.iter().any(|b| t.starts_with(b)) => {
                     Some(format!("hz_{}", &t[3..]))
                 }
-                "gl_VertexID" => Some("gl_VertexIndex".into()),
-                "gl_InstanceID" => Some("gl_InstanceIndex".into()),
                 _ if old && LATER_KEYWORDS.contains(&t) => Some(format!("hz_kw_{t}")),
                 _ => None,
             };

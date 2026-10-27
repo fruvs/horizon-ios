@@ -449,11 +449,18 @@ impl Game<'_> {
 
     /// `Entity.getTeam` of a mob (a mob joins a team by its UUID).
     pub(super) fn mob_team(&self, id: u32) -> Option<&sb::Team> {
+        if let Some(remote) = &self.remote {
+            return remote.entity_team(&self.score.board, id);
+        }
         let uuid = self.persist.uuids.get(&id)?;
         self.score.board.players_team(&uuid_text(*uuid))
     }
     pub(super) fn player_team(&self) -> Option<&sb::Team> {
-        self.score.board.players_team(self.acting_player_name())
+        let name = self.remote.as_ref().map_or_else(
+            || self.acting_player_name(),
+            |remote| remote.profile_name.as_str(),
+        );
+        self.score.board.players_team(name)
     }
     /// The teams of the player and of the mobs on one (empty without teams).
     pub(super) fn mob_teams(&self) -> horizon_client::mobs::Teams<'_> {
@@ -464,10 +471,9 @@ impl Game<'_> {
         horizon_client::mobs::Teams {
             player: self.player_team(),
             mobs: self
-                .persist
-                .uuids
+                .mobs
                 .iter()
-                .filter_map(|(id, uuid)| Some((*id, board.players_team(&uuid_text(*uuid))?)))
+                .filter_map(|mob| Some((mob.id, self.mob_team(mob.id)?)))
                 .collect(),
         }
     }

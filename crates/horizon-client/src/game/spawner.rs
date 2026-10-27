@@ -430,7 +430,7 @@ impl Game<'_> {
                     out,
                 );
             }
-            horizon_client::mobs::render::render_posed(
+            let items = horizon_client::mobs::render::render_posed(
                 mob,
                 alpha as f32,
                 origin,
@@ -439,6 +439,9 @@ impl Game<'_> {
                 self.res.mob_data(),
                 out,
             );
+            for item in items {
+                self.mark_rendered_item(item.start, item.end, &item.item);
+            }
         }
     }
 }

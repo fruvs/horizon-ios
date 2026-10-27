@@ -316,6 +316,7 @@ impl Game<'_> {
         light: u32,
         out: &mut Vec<Vertex>,
     ) {
+        let start = out.len();
         let mut sink = WorldSink {
             out,
             light,
@@ -328,6 +329,21 @@ impl Game<'_> {
             pose,
             &mut sink,
         );
+        if matches!(
+            state.display,
+            DisplayContext::FirstPersonLeftHand | DisplayContext::FirstPersonRightHand
+        ) {
+            if self.pack_ids.is_some() {
+                horizon_client::gfx::pack_draw::EntitySpan::item_range(
+                    &mut self.hand_spans.borrow_mut(),
+                    start,
+                    out.len(),
+                    self.rendered_item_id(&state.item),
+                );
+            }
+        } else {
+            self.mark_rendered_item(start, out.len(), &state.item);
+        }
     }
     /// [`Self::submit_item_world`] without the level's diffuse shading.
     pub(super) fn submit_item_unlit(
@@ -337,6 +353,7 @@ impl Game<'_> {
         light: u32,
         out: &mut Vec<Vertex>,
     ) {
+        let start = out.len();
         let mut sink = WorldSink {
             out,
             light,
@@ -349,6 +366,21 @@ impl Game<'_> {
             pose,
             &mut sink,
         );
+        if matches!(
+            state.display,
+            DisplayContext::FirstPersonLeftHand | DisplayContext::FirstPersonRightHand
+        ) {
+            if self.pack_ids.is_some() {
+                horizon_client::gfx::pack_draw::EntitySpan::item_range(
+                    &mut self.hand_spans.borrow_mut(),
+                    start,
+                    out.len(),
+                    self.rendered_item_id(&state.item),
+                );
+            }
+        } else {
+            self.mark_rendered_item(start, out.len(), &state.item);
+        }
     }
     /// `ItemEntityRenderer.submit` for every dropped item.
     pub(super) fn dropped_item_geometry(

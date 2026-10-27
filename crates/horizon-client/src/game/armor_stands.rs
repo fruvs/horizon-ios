@@ -119,14 +119,14 @@ impl ArmorStandAssets {
 impl Game<'_> {
     /// `HumanoidArmorLayer` for the player: (model, texture rect, colour) of
     /// each worn piece, head to feet.
-    pub(super) fn player_armor_layers(&self) -> Vec<(&Part, [f32; 4], u32)> {
+    pub(super) fn player_armor_layers(&self) -> Vec<(&Part, [f32; 4], u32, String)> {
         self.stack_armor_layers(&self.armor)
     }
     /// `HumanoidArmorLayer` for worn stacks (head to feet), trims included.
     pub(super) fn stack_armor_layers(
         &self,
         armor: &[Option<ItemStack>; 4],
-    ) -> Vec<(&Part, [f32; 4], u32)> {
+    ) -> Vec<(&Part, [f32; 4], u32, String)> {
         self.armor_layers(
             armor
                 .each_ref()
@@ -135,7 +135,7 @@ impl Game<'_> {
     }
     /// `HumanoidArmorLayer` for another player's model: the armour it wears
     /// (`extra.head` .. `extra.feet`).
-    pub(super) fn worn_armor_layers(&self, m: &Mob) -> Vec<(&Part, [f32; 4], u32)> {
+    pub(super) fn worn_armor_layers(&self, m: &Mob) -> Vec<(&Part, [f32; 4], u32, String)> {
         let e = &m.extra;
         self.armor_layers(
             [&e.head, &e.chest, &e.legs, &e.feet].map(|s| s.as_deref().map(|i| (i, None))),
@@ -146,7 +146,7 @@ impl Game<'_> {
     fn armor_layers(
         &self,
         worn: [Option<(&str, Option<&ItemStack>)>; 4],
-    ) -> Vec<(&Part, [f32; 4], u32)> {
+    ) -> Vec<(&Part, [f32; 4], u32, String)> {
         let assets = &self.armor_stand_assets;
         let mut out = Vec::new();
         for (item, layer) in worn
@@ -182,13 +182,24 @@ impl Game<'_> {
             let color = undyed.map_or(0xFFFF_FFFF, |c| {
                 0xFF00_0000 | (c & 0xFF) << 16 | (c & 0xFF00) | (c >> 16) & 0xFF
             });
-            out.push((part, [r.u0, r.v0, r.u1, r.v1], color));
+            out.push((part, [r.u0, r.v0, r.u1, r.v1], color, item.to_owned()));
             // EquipmentLayerRenderer: the trim layer over the armour.
             if let Some(r) = stack
                 .and_then(|s| assets.trim_texture(&asset, kind, s))
                 .and_then(|t| self.gui.atlas.sprites.get(&t.sprite()))
             {
-                out.push((part, [r.u0, r.v0, r.u1, r.v1], 0xFFFF_FFFF));
+                let material = stack
+                    .and_then(|s| s.extra.as_ref()?.trim.as_ref())
+                    .map(|(material, _)| material.as_ref())
+                    .unwrap_or("");
+                let (namespace, material) =
+                    material.split_once(':').unwrap_or(("minecraft", material));
+                out.push((
+                    part,
+                    [r.u0, r.v0, r.u1, r.v1],
+                    0xFFFF_FFFF,
+                    format!("{namespace}:trim_{material}"),
+                ));
             }
         }
         out
@@ -712,6 +723,7 @@ impl Game<'_> {
                     0xFF00_0000 | (c & 0xFF) << 16 | (c & 0xFF00) | (c >> 16) & 0xFF
                 });
                 let layer_poses = Poses::new(part);
+                let armor_start = out.len();
                 horizon_client::mobs::render::draw(
                     part,
                     base,
@@ -722,11 +734,13 @@ impl Game<'_> {
                     0,
                     out,
                 );
+                self.mark_rendered_item(armor_start, out.len(), &stack.item);
                 // EquipmentLayerRenderer: the trim layer over the armour.
                 if let Some(trim) = assets
                     .trim_texture(&asset, kind, stack)
                     .and_then(|t| uv_of(&t.sprite()))
                 {
+                    let trim_start = out.len();
                     horizon_client::mobs::render::draw(
                         part,
                         base,
@@ -737,6 +751,17 @@ impl Game<'_> {
                         0,
                         out,
                     );
+                    if let Some((material, _)) =
+                        stack.extra.as_ref().and_then(|extra| extra.trim.as_ref())
+                    {
+                        let (namespace, material) =
+                            material.split_once(':').unwrap_or(("minecraft", material));
+                        self.mark_rendered_item(
+                            trim_start,
+                            out.len(),
+                            &format!("{namespace}:trim_{material}"),
+                        );
+                    }
                 }
             }
             self.cull_entity_vertices(out, entity_start);
@@ -871,6 +896,7 @@ impl Game<'_> {
                     }
                 },
             };
+            let start = out.len();
             let mut sink = horizon_client::item_render::WorldSink {
                 out,
                 light,
@@ -893,6 +919,7 @@ impl Game<'_> {
                 &self.item_host(),
                 &mut sink,
             );
+            self.mark_rendered_item(start, out.len(), &stack.item);
             return;
         }
         // A head item that is not worn armour.

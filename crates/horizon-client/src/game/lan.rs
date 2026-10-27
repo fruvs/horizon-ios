@@ -1569,7 +1569,7 @@ impl Game<'_> {
                 m.position.z.floor() as i32,
             );
             let packed = (u32::from(light >> 4) * 16) | ((u32::from(light & 15) * 16) << 8);
-            horizon_client::mobs::render::render_with(
+            let items = horizon_client::mobs::render::render_with(
                 m,
                 alpha as f32,
                 camera,
@@ -1582,6 +1582,9 @@ impl Game<'_> {
                 ),
                 out,
             );
+            for item in items {
+                self.mark_rendered_item(item.start, item.end, &item.item);
+            }
             self.held_item_geometry(m, camera, alpha, packed, true, out);
             if !m.glowing {
                 self.cull_entity_vertices(out, entity_start);

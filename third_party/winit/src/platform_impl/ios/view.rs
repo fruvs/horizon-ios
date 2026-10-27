@@ -19,7 +19,7 @@ use super::window::WinitUIWindow;
 use crate::dpi::PhysicalPosition;
 use crate::event::{ElementState, Event, Force, KeyEvent, Touch, TouchPhase, WindowEvent};
 use crate::keyboard::{
-    Key, KeyCode, KeyLocation, ModifiersState, NamedKey, NativeKeyCode, PhysicalKey,
+    Key, KeyCode, KeyLocation, ModifiersState, NamedKey, PhysicalKey,
 };
 use crate::platform_impl::platform::DEVICE_ID;
 use crate::platform_impl::KeyEventExtra;
@@ -757,37 +757,40 @@ impl WinitView {
         let window = self.window().unwrap();
         let window_id = RootWindowId(window.id());
         let mtm = MainThreadMarker::new().unwrap();
-        // send individual events for each character
+        // Both software typing and hardware navigation can arrive via insertText:.
+        // Decode navigation tokens before expanding genuine text into characters.
         app_state::handle_nonuser_events(
             mtm,
-            text.to_string().chars().flat_map(|c| {
-                let text = smol_str::SmolStr::from_iter([c]);
-                // Emit both press and release events
-                [ElementState::Pressed, ElementState::Released].map(|state| {
-                    EventWrapper::StaticEvent(Event::WindowEvent {
-                        window_id,
-                        event: WindowEvent::KeyboardInput {
-                            event: KeyEvent {
-                                text: if state == ElementState::Pressed {
-                                    Some(text.clone())
-                                } else {
-                                    None
+            super::hardware_keyboard::insert_text_keys(&text.to_string())
+                .into_iter()
+                .flat_map(|(physical_key, logical_key)| {
+                    let text = match &logical_key {
+                        Key::Character(text) => Some(text.clone()),
+                        _ => None,
+                    };
+                    [ElementState::Pressed, ElementState::Released].map(|state| {
+                        EventWrapper::StaticEvent(Event::WindowEvent {
+                            window_id,
+                            event: WindowEvent::KeyboardInput {
+                                event: KeyEvent {
+                                    text: if state == ElementState::Pressed {
+                                        text.clone()
+                                    } else {
+                                        None
+                                    },
+                                    state,
+                                    location: KeyLocation::Standard,
+                                    repeat: false,
+                                    logical_key: logical_key.clone(),
+                                    physical_key,
+                                    platform_specific: KeyEventExtra {},
                                 },
-                                state,
-                                location: KeyLocation::Standard,
-                                repeat: false,
-                                logical_key: Key::Character(text.clone()),
-                                physical_key: PhysicalKey::Unidentified(
-                                    NativeKeyCode::Unidentified,
-                                ),
-                                platform_specific: KeyEventExtra {},
+                                is_synthetic: false,
+                                device_id: DEVICE_ID,
                             },
-                            is_synthetic: false,
-                            device_id: DEVICE_ID,
-                        },
+                        })
                     })
-                })
-            }),
+                }),
         );
     }
 

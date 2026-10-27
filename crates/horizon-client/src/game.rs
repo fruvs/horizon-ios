@@ -23,6 +23,7 @@ mod campfire;
 mod campfire_douse;
 mod cartography;
 mod chat;
+mod chat_input;
 mod client_ambient;
 mod clipboard;
 mod combat;
@@ -1381,6 +1382,8 @@ struct Game<'a> {
     /// Runs of `entity_vertices` by entity, for a shader pack's per-entity draws; recorded only
     /// while `pack_ids` is set (game/shader_packs.rs).
     entity_spans: std::cell::RefCell<Vec<horizon_client::gfx::pack_draw::EntitySpan>>,
+    hand_spans: std::cell::RefCell<Vec<horizon_client::gfx::pack_draw::EntitySpan>>,
+    emitting_entity_items: std::cell::Cell<bool>,
     /// The shader pack's entity and block entity ids, while one draws entities.
     pack_ids: Option<shader_packs::PackIds>,
     started: Instant,
@@ -7405,6 +7408,7 @@ impl Game<'_> {
         mut out: Vec<Vertex>,
     ) -> Vec<Vertex> {
         self.entity_spans.borrow_mut().clear();
+        self.emitting_entity_items.set(true);
         self.prepare_entity_culling(camera);
         self.prepare_trims();
         self.mark_entity(out.len(), "minecraft:entity_flame");
@@ -7819,6 +7823,7 @@ impl Game<'_> {
                 }
             }
         }
+        self.emitting_entity_items.set(false);
         out
     }
 
@@ -9912,6 +9917,7 @@ impl Game<'_> {
     /// FirstPersonHandsAndItemsRenderer: the right arm or the held items of
     /// both hands in view space, converted to camera-relative world space.
     fn hand_geometry(&mut self, alpha: f64) -> Vec<Vertex> {
+        self.hand_spans.borrow_mut().clear();
         let mut out = Vec::new();
         // GameRenderer.renderItemInHand: F1 hides the hand with the HUD.
         if self.spectator()
@@ -9964,6 +9970,18 @@ impl Game<'_> {
         for (i, (hand, item)) in Hand::BOTH.into_iter().zip(items).enumerate() {
             if !shown[i] {
                 continue;
+            }
+            if self.pack_ids.is_some() {
+                self.hand_spans
+                    .borrow_mut()
+                    .push(horizon_client::gfx::pack_draw::EntitySpan {
+                        start: out.len() as u32,
+                        stage: horizon_shaders::render_stage("HAND_SOLID"),
+                        item_id: item
+                            .as_ref()
+                            .map_or(0, |stack| self.rendered_item_id(&stack.item)),
+                        ..Default::default()
+                    });
             }
             let (attack, inverse_height) = (attacks[i], inverse_heights[i]);
             let sqrt_attack = attack.sqrt();
@@ -11178,6 +11196,7 @@ impl Game<'_> {
             (Vec::new(), None)
         };
         let hand = if title || self.scoping() {
+            self.hand_spans.borrow_mut().clear();
             Vec::new()
         } else {
             self.hand_geometry(camera_alpha)
@@ -11215,6 +11234,7 @@ impl Game<'_> {
         // map_patches any earlier leaves them a frame behind.
         hud.patches.append(&mut self.map_patches);
         let entity_spans = std::mem::take(self.entity_spans.get_mut());
+        let hand_spans = std::mem::take(self.hand_spans.get_mut());
         let frame = Frame {
             weather: &weather,
             weather_time: horizon_client::weather::Time::new(self.world.game_time, alpha as f32),
@@ -11298,6 +11318,7 @@ impl Game<'_> {
             },
             stars: stars.filter(|_| self.settings.horizon.sky || title),
             hand: &hand,
+            hand_spans: &hand_spans,
             hand_fov_degrees: self.hud_fov_degrees(camera_alpha as f32, camera.to_array()),
             screen: &screen,
             pack: pack_inputs,
@@ -11337,6 +11358,7 @@ impl Game<'_> {
         self.entity_vertices = entities;
         self.glowing_vertices = glowing;
         *self.entity_spans.get_mut() = entity_spans;
+        *self.hand_spans.get_mut() = hand_spans;
         self.see_through_vertices = see_through;
         result
     }
@@ -12075,6 +12097,7 @@ impl ApplicationHandler for Game<'_> {
                 && event.state == ElementState::Released
                 && let PhysicalKey::Code(key) = event.physical_key
             {
+                self.keys.remove(&key);
                 self.extras_key(key, false, false);
                 self.mod_key(key, false, false);
                 match self.settings.keys.translate(key) {
@@ -12463,22 +12486,28 @@ impl ApplicationHandler for Game<'_> {
                 }
                 WindowEvent::KeyboardInput { event, .. } if self.dialog_open() => {
                     let shortcut = self.edit_shortcut(&event);
-                    if event.state == ElementState::Pressed
-                        && let PhysicalKey::Code(key) = event.physical_key
-                    {
-                        self.dialog_key(key, shortcut, event.text.as_deref())?
+                    if event.state == ElementState::Pressed {
+                        if let PhysicalKey::Code(key) = event.physical_key {
+                            self.dialog_key(key, shortcut, event.text.as_deref())?;
+                        } else if let Some(text) = chat_input::text_without_physical_key(
+                            event.physical_key,
+                            event.state,
+                            event.text.as_deref(),
+                        ) {
+                            self.dialog_text(text);
+                        }
                     }
                 }
                 WindowEvent::KeyboardInput { event, .. }
                     if self.screen == Screen::Chat && self.title.is_none() =>
                 {
-                    if let PhysicalKey::Code(key) = event.physical_key {
-                        if event.state == ElementState::Pressed {
+                    if event.state == ElementState::Pressed {
+                        if let PhysicalKey::Code(key) = event.physical_key {
                             self.keys.insert(key);
-                            self.chat_key(&event);
-                        } else {
-                            self.keys.remove(&key);
                         }
+                        self.chat_key(&event);
+                    } else if let PhysicalKey::Code(key) = event.physical_key {
+                        self.keys.remove(&key);
                     }
                 }
                 WindowEvent::KeyboardInput { event, .. } if self.sign_edit.is_some() => {
@@ -12570,6 +12599,14 @@ impl ApplicationHandler for Game<'_> {
                     }
                     if let PhysicalKey::Code(key) = event.physical_key {
                         self.options_key(key, event.text.as_deref())?;
+                    } else if !self.options_waiting_for_key()
+                        && let Some(text) = chat_input::text_without_physical_key(
+                            event.physical_key,
+                            event.state,
+                            event.text.as_deref(),
+                        )
+                    {
+                        self.ui.options.type_text(&self.gui.atlas, text);
                     }
                 }
                 WindowEvent::KeyboardInput { event, .. } if self.title.is_some() => {
@@ -13098,6 +13135,8 @@ impl<'a> Game<'a> {
             see_through_vertices: Vec::new(),
             glowing_vertices: Vec::new(),
             entity_spans: Default::default(),
+            hand_spans: Default::default(),
+            emitting_entity_items: Default::default(),
             pack_ids: None,
             health_hud: hud_layout::HealthHud::default(),
             started: now,
@@ -14094,6 +14133,7 @@ fn loading_frame(hud: &HudBatch) -> Frame<'_> {
         celestial: &[],
         stars: None,
         hand: &[],
+        hand_spans: &[],
         hand_fov_degrees: 70.0,
         screen: &[],
         pack: Default::default(),
