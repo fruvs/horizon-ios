@@ -347,22 +347,49 @@ fn smooth(value: f32, target: f32, half_life: f32, dt: f32) -> f32 {
     target + (value - target) * 0.5f32.powf(dt / half_life)
 }
 
+/// Keep the pack projection sparse: packs reconstruct depth from its diagonal and final
+/// column. Camera bob belongs in model-view, preserving the world's P * bob * rotation.
+fn camera_matrices(
+    yaw: f32,
+    pitch: f32,
+    bob: Mat4,
+    fov_degrees: f32,
+    aspect: f32,
+    far: f32,
+) -> (Mat4, Mat4) {
+    let view = bob * crate::camera::view_matrix(yaw, pitch);
+    let projection = Mat4::perspective_rh_gl(fov_degrees.to_radians(), aspect, 0.05, far);
+    (view, projection)
+}
+
 impl FrameUniforms {
+    fn camera_history(
+        &mut self,
+        camera: DVec3,
+        view: Mat4,
+        projection: Mat4,
+    ) -> (DVec3, Mat4, Mat4) {
+        let previous = self.previous.unwrap_or((camera, view, projection));
+        self.previous = Some((camera, view, projection));
+        previous
+    }
+
     /// This frame's values for a render size of `size` pixels.
     pub fn update(&mut self, frame: &Frame, inputs: &PackInputs, size: [u32; 2]) {
         let now = std::time::Instant::now();
         let dt = self.last.map_or(0.0, |l| (now - l).as_secs_f32());
         self.last = Some(now);
         let aspect = size[0] as f32 / size[1].max(1) as f32;
-        let view = crate::camera::view_matrix(frame.yaw, frame.pitch);
-        let projection = Mat4::perspective_rh_gl(
-            frame.fov_degrees.to_radians(),
+        let (view, projection) = camera_matrices(
+            frame.yaw,
+            frame.pitch,
+            frame.bob,
+            frame.fov_degrees,
             aspect,
-            0.05,
             frame.depth_far,
-        ) * frame.bob;
+        );
         let (previous_absolute, previous_view, previous_projection) =
-            self.previous.unwrap_or((frame.camera, view, projection));
+            self.camera_history(frame.camera, view, projection);
         update_camera_origin(&mut self.camera_origin, frame.camera, previous_absolute);
         // Both frames use the SAME origin: changing origins must not create camera motion
         // in temporal reprojection. Geometry and gbuffer matrices are camera-relative.
@@ -370,7 +397,6 @@ impl FrameUniforms {
         let previous_camera = (previous_absolute - self.camera_origin).as_vec3();
         let (camera_int, camera_fract) = split_position(frame.camera);
         let (previous_int, previous_fract) = split_position(previous_absolute);
-        self.previous = Some((frame.camera, view, projection));
 
         let to_view = |v: Vec3| view.transform_vector3(v);
         let sun_angle = (frame.sky.sun_angle / 360.0 + 0.25).rem_euclid(1.0);
@@ -571,6 +597,122 @@ pub fn index(name: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn walking_bob(phase: f32) -> Mat4 {
+        Mat4::from_translation(Vec3::new(
+            phase.sin() * 0.08,
+            -phase.cos().abs() * 0.07,
+            0.0,
+        )) * Mat4::from_rotation_z(phase.sin() * 0.035)
+            * Mat4::from_rotation_x(phase.cos() * 0.025)
+    }
+
+    // The sparse inverse-projection calculation used by Solas ToNDC and Complementary
+    // ScreenToView: off-diagonal matrix elements are deliberately not read by those packs.
+    fn pack_screen_to_view(projection: Mat4, ndc: Vec3) -> Vec3 {
+        let inverse = projection.inverse();
+        let diagonal = Vec4::new(
+            inverse.x_axis.x,
+            inverse.y_axis.y,
+            inverse.z_axis.z,
+            inverse.z_axis.w,
+        );
+        let homogeneous = diagonal * Vec4::new(ndc.x, ndc.y, ndc.z, ndc.z) + inverse.w_axis;
+        homogeneous.truncate() / homogeneous.w
+    }
+
+    #[test]
+    fn bobbed_pack_matrices_preserve_native_geometry_and_pure_projection() {
+        let (yaw, pitch, fov, aspect, far) = (28.0, 17.0, 73.0_f32, 1.7, 512.0);
+        let native_projection = Mat4::perspective_rh_gl(fov.to_radians(), aspect, 0.05, far);
+        let rotation = crate::camera::view_matrix(yaw, pitch);
+        for bob in [
+            Mat4::IDENTITY,
+            walking_bob(0.4),
+            walking_bob(1.8),
+            walking_bob(3.2),
+        ] {
+            let (view, projection) = camera_matrices(yaw, pitch, bob, fov, aspect, far);
+            assert!(projection.abs_diff_eq(native_projection, 1e-6));
+            assert!((projection * view).abs_diff_eq(native_projection * bob * rotation, 1e-5));
+            assert!((view * view.inverse()).abs_diff_eq(Mat4::IDENTITY, 1e-5));
+            assert!((projection * projection.inverse()).abs_diff_eq(Mat4::IDENTITY, 1e-5));
+        }
+    }
+
+    #[test]
+    fn walking_bob_keeps_pack_depth_reconstruction_correct() {
+        let rotation = crate::camera::view_matrix(31.0, 12.0);
+        let points = [
+            Vec3::new(-1.0, 0.4, -4.0),
+            Vec3::new(4.0, -2.0, -40.0),
+            Vec3::new(-30.0, 10.0, -120.0),
+        ];
+        let mut old_split_error = 0.0_f32;
+        for bob in [
+            Mat4::IDENTITY,
+            walking_bob(0.4),
+            walking_bob(1.8),
+            walking_bob(3.2),
+        ] {
+            let (view, projection) = camera_matrices(31.0, 12.0, bob, 73.0, 1.7, 512.0);
+            for point in points {
+                let world = rotation.inverse().transform_point3(point);
+                let expected = view.transform_point3(world);
+                let clip = projection * expected.extend(1.0);
+                let ndc = clip.truncate() / clip.w;
+                let reconstructed = pack_screen_to_view(projection, ndc);
+                assert!(
+                    reconstructed.abs_diff_eq(expected, 0.03),
+                    "{reconstructed:?} != {expected:?}"
+                );
+                // Demonstrate that moving bob into projection, as before the repair, makes
+                // the packs' sparse formula disagree with the rotation-only view position.
+                let old_projection = projection * bob;
+                old_split_error =
+                    old_split_error.max(pack_screen_to_view(old_projection, ndc).distance(point));
+            }
+        }
+        assert!(
+            old_split_error > 0.5,
+            "regression fixture did not exercise the old split: {old_split_error}"
+        );
+    }
+
+    #[test]
+    fn previous_camera_matrices_reproject_successive_bobbed_frames() {
+        let mut uniforms = FrameUniforms::default();
+        let world_point = Vec3::new(2.0, 1.0, 20.0);
+        let mut expected_previous: Option<(DVec3, Mat4, Mat4)> = None;
+        for (index, phase) in [0.4, 0.8, 1.3].into_iter().enumerate() {
+            let camera = DVec3::new(index as f64 * 0.1, 0.0, index as f64 * 0.15);
+            let (view, projection) = camera_matrices(
+                3.0 + index as f32,
+                4.0,
+                walking_bob(phase),
+                73.0,
+                1.7,
+                512.0,
+            );
+            let previous = uniforms.camera_history(camera, view, projection);
+            let expected = expected_previous.unwrap_or((camera, view, projection));
+            assert_eq!(previous, expected);
+            let current_position = world_point - camera.as_vec3();
+            let clip = projection * view * current_position.extend(1.0);
+            let ndc = clip.truncate() / clip.w;
+            let current_view = pack_screen_to_view(projection, ndc);
+            let current_player = view.inverse().transform_point3(current_view);
+            let previous_player = current_player + (camera - previous.0).as_vec3();
+            let reprojected = previous.2 * previous.1 * previous_player.extend(1.0);
+            let reference =
+                previous.2 * previous.1 * (world_point - previous.0.as_vec3()).extend(1.0);
+            assert!(
+                (reprojected.truncate() / reprojected.w)
+                    .abs_diff_eq(reference.truncate() / reference.w, 0.002)
+            );
+            expected_previous = Some((camera, view, projection));
+        }
+    }
 
     #[test]
     fn camera_split_preserves_negative_and_distant_sub_block_positions() {

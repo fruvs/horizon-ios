@@ -28,12 +28,11 @@ pub fn inputs() -> horizon_shaders::GbuffersInputs {
     inputs
 }
 
-/// The hand's projection in GL's conventions: `hud_fov` degrees, the view bob, depth scaled by
-/// `MC_HAND_DEPTH`.
-pub fn projection(hud_fov: f32, aspect: f32, far: f32, bob: Mat4) -> Mat4 {
+/// The hand's projection in GL's conventions: `hud_fov` degrees and depth scaled by
+/// `MC_HAND_DEPTH`. The shared gbuffer model-view already supplies the camera bob.
+pub fn projection(hud_fov: f32, aspect: f32, far: f32) -> Mat4 {
     Mat4::from_scale(glam::Vec3::new(1.0, 1.0, HAND_DEPTH))
         * Mat4::perspective_rh_gl(hud_fov.to_radians(), aspect, 0.05, far)
-        * bob
 }
 
 /// The hand's vertices (also read at set 1 for normals and tangents), its uniform and quad
@@ -243,11 +242,32 @@ mod tests {
         assert!(item_draws(0, &[]).is_empty());
     }
 
+    #[test]
+    fn hand_model_view_applies_walking_bob_exactly_once() {
+        let (fov, aspect, far) = (70.0_f32, 16.0 / 9.0, 512.0);
+        let bob = Mat4::from_translation(glam::Vec3::new(0.04, -0.07, 0.0))
+            * Mat4::from_rotation_z(0.035)
+            * Mat4::from_rotation_x(0.02);
+        let rotation = crate::camera::view_matrix(28.0, 17.0);
+        let view = bob * rotation;
+        let hand_projection = projection(fov, aspect, far);
+        let native = Mat4::from_scale(glam::Vec3::new(1.0, 1.0, HAND_DEPTH))
+            * Mat4::perspective_rh_gl(fov.to_radians(), aspect, 0.05, far)
+            * bob
+            * rotation;
+        assert!((hand_projection * view).abs_diff_eq(native, 1e-5));
+        assert!(
+            !(hand_projection * bob * view).abs_diff_eq(native, 1e-4),
+            "double bob should change the regression fixture"
+        );
+        assert!((hand_projection * hand_projection.inverse()).abs_diff_eq(Mat4::IDENTITY, 1e-5));
+    }
+
     /// The hand's window depth lies within `MC_HAND_DEPTH` of the middle (packs tell the hand
     /// apart by it), and x, y match the plain projection.
     #[test]
     fn hand_depth_is_scaled_around_the_middle() {
-        let p = projection(70.0, 16.0 / 9.0, 512.0, Mat4::IDENTITY);
+        let p = projection(70.0, 16.0 / 9.0, 512.0);
         let plain = Mat4::perspective_rh_gl(70f32.to_radians(), 16.0 / 9.0, 0.05, 512.0);
         for z in [-0.06f32, -0.5, -3.0, -400.0] {
             let v = glam::Vec4::new(0.1, -0.2, z, 1.0);
