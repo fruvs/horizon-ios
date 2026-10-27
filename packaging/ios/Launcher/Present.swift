@@ -82,6 +82,11 @@ private final class LauncherHostingController: UIHostingController<AnyView> {
     override var supportedInterfaceOrientations: UIInterfaceOrientationMask {
         UIDevice.current.userInterfaceIdiom == .pad ? .all : .portrait
     }
-    override var preferredInterfaceOrientationForPresentation: UIInterfaceOrientation { .portrait }
+    override var preferredInterfaceOrientationForPresentation: UIInterfaceOrientation {
+        guard UIDevice.current.userInterfaceIdiom == .pad else { return .portrait }
+        return UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .first(where: { $0.activationState == .foregroundActive })?.interfaceOrientation ?? .portrait
+    }
     override var preferredStatusBarStyle: UIStatusBarStyle { .lightContent }
 }

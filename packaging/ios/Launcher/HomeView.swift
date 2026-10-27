@@ -1,7 +1,7 @@
 import SwiftUI
 import UIKit
 
-/// The launcher, upright: Play (the game, its worlds and the player), Servers, Packs, Gallery and Settings
+/// The adaptive phone and iPad launcher: Play, Servers, Packs, Gallery and Settings
 /// (What's New is in Settings). Everything it knows about the game it asks the game under it (GameLink.swift,
 /// Bridge.swift).
 struct HomeView: View {
@@ -17,9 +17,21 @@ struct HomeView: View {
     @State private var nameDraft = ""
     @State private var nameRejected = false
     @State private var tab = Tab.play
+    @Environment(\.dynamicTypeSize) private var typeSize
 
-    enum Tab: Hashable {
+    enum Tab: String, CaseIterable {
         case play, servers, packs, gallery, settings
+
+        var title: String { rawValue.capitalized }
+        var icon: String {
+            switch self {
+            case .play: return "play.fill"
+            case .servers: return "globe"
+            case .packs: return "square.stack.3d.up.fill"
+            case .gallery: return "photo.on.rectangle"
+            case .settings: return "slider.horizontal.3"
+            }
+        }
     }
 
     // Spelled out: a private property makes the memberwise one private, and Present.swift builds this view.
@@ -35,23 +47,31 @@ struct HomeView: View {
     }
 
     var body: some View {
-        TabView(selection: $tab) {
-            page(refresh: { await link.reload() }) { PlayPage(link: link, device: device, download: download, player: player, head: head,
-                            account: account, editName: editName) }
-                .tabItem { Label("Play", systemImage: "play.fill") }
-                .tag(Tab.play)
-            page(refresh: { await link.reloadServers() }) { ServersPage(link: link, account: account) }
-                .tabItem { Label("Servers", systemImage: "globe") }
-                .tag(Tab.servers)
-            page { PacksPage(link: link) }
-                .tabItem { Label("Packs", systemImage: "square.stack.3d.up.fill") }
-                .tag(Tab.packs)
-            page { GalleryPage() }
-                .tabItem { Label("Gallery", systemImage: "photo.on.rectangle") }
-                .tag(Tab.gallery)
-            page { SettingsPage(link: link, download: download) }
-                .tabItem { Label("Settings", systemImage: "slider.horizontal.3") }
-                .tag(Tab.settings)
+        GeometryReader { geometry in
+            Group {
+                if geometry.size.width >= 1000 && !typeSize.isAccessibilitySize {
+                    HStack(spacing: 0) {
+                        navigationRail.frame(width: 208)
+                            .accessibilityIdentifier("launcher-navigation-rail")
+                        Rectangle().fill(Theme.border).frame(width: 1)
+                        content(for: tab)
+                    }
+                } else {
+                    TabView(selection: $tab) {
+                        ForEach(Tab.allCases, id: \.self) { item in
+                            content(for: item)
+                                .tabItem { Label(item.title, systemImage: item.icon) }
+                                .tag(item)
+                        }
+                    }
+                }
+            }
+            .safeAreaInset(edge: .top, spacing: 0) {
+                Header(name: shownName, face: head.face, canEditName: account.profile == nil, editName: editName)
+                    .frame(maxWidth: .infinity)
+                    .background(Theme.background)
+            }
+            .background(Theme.background.ignoresSafeArea())
         }
         .tint(Theme.accentText)
         .onChange(of: tab) { _ in Haptics.tap() }
@@ -61,6 +81,7 @@ struct HomeView: View {
                 .textInputAutocapitalization(.never)
                 .autocorrectionDisabled()
             Button("Save") {
+                guard account.profile == nil else { return }
                 nameRejected = !player.save(nameDraft.trimmingCharacters(in: .whitespaces))
             }
             Button("Cancel", role: .cancel) {}
@@ -84,30 +105,89 @@ struct HomeView: View {
         .task(id: shownName) { await head.load(shownName) }
         // A signed-in account goes to the game, renewed when it is close to expiring.
         .task(id: account.profile) { await account.handOver() }
+        .onChange(of: account.profile) { profile in
+            if profile != nil {
+                editingName = false
+                nameDraft = ""
+            }
+        }
         .task {
             link.uncover = onPlay
             await link.watch()
         }
     }
 
-    /// One tab's page: the header bar over a scrolling column, on the launcher's background.
-    private func page<Content: View>(refresh: (() async -> Void)? = nil,
-                                     @ViewBuilder _ content: () -> Content) -> some View {
-        ScrollView {
-            content().pageColumn()
+    private var navigationRail: some View {
+        VStack(spacing: 8) {
+            ForEach(Tab.allCases, id: \.self) { item in
+                Button { tab = item } label: {
+                    HStack(spacing: 12) {
+                        Image(systemName: item.icon)
+                            .font(.system(size: 17, weight: .medium))
+                            .frame(width: 24)
+                        Text(item.title).font(Theme.pixel(21))
+                        Spacer(minLength: 0)
+                    }
+                    .foregroundStyle(tab == item ? Theme.text : Theme.textMuted)
+                    .padding(.horizontal, 16)
+                    .frame(minHeight: 52)
+                    .background(tab == item ? Theme.notice : Color.clear,
+                                in: RoundedRectangle(cornerRadius: 10))
+                }
+                .buttonStyle(PressStyle())
+                .accessibilityAddTraits(tab == item ? .isSelected : [])
+            }
+            Spacer(minLength: 0)
         }
-        .refreshable { await refresh?() }
-        .safeAreaInset(edge: .top, spacing: 0) {
-            Header(name: shownName, face: head.face, editName: editName)
-                .frame(maxWidth: 520).frame(maxWidth: .infinity).background(Theme.background)
+        .padding(16)
+        .padding(.top, 12)
+        .background(Theme.surfaceSunken)
+    }
+
+    @ViewBuilder
+    private func content(for item: Tab) -> some View {
+        switch item {
+        case .play:
+            page(maximumWidth: 1440, refresh: { await link.reload() }) { width in
+                PlayPage(link: link, device: device, download: download, player: player,
+                         head: head, account: account, editName: editName, availableWidth: width)
+            }
+        case .servers:
+            page(refresh: { await link.reloadServers() }) { _ in ServersPage(link: link, account: account) }
+        case .packs:
+            page { _ in PacksPage(link: link) }
+        case .gallery:
+            page { _ in GalleryPage() }
+        case .settings:
+            page { _ in SettingsPage(link: link, download: download) }
         }
-        .background(Theme.background.ignoresSafeArea())
+    }
+
+    /// Size content from the actual window, including Split View and portrait rotation.
+    private func page<Content: View>(maximumWidth: CGFloat = 1080,
+                                     refresh: (() async -> Void)? = nil,
+                                     @ViewBuilder _ content: @escaping (CGFloat) -> Content) -> some View {
+        GeometryReader { geometry in
+            let gutter: CGFloat = geometry.size.width >= 700 ? 28 : 20
+            let width = max(0, min(geometry.size.width, maximumWidth) - gutter * 2)
+            ScrollView {
+                content(width)
+                    .frame(maxWidth: .infinity, alignment: .topLeading)
+                    .padding(.horizontal, gutter)
+                    .padding(.top, 24)
+                    .padding(.bottom, 32)
+                    .frame(maxWidth: maximumWidth)
+                    .frame(maxWidth: .infinity)
+            }
+            .refreshable { await refresh?() }
+        }
     }
 
     /// The Microsoft account's name when one is signed in, else the offline name.
     private var shownName: String? { account.profile?.name ?? player.name }
 
     private func editName() {
+        guard account.profile == nil else { return }
         nameDraft = player.name ?? ""
         editingName = true
     }
@@ -118,6 +198,7 @@ struct HomeView: View {
 private struct Header: View {
     let name: String?
     let face: UIImage?
+    let canEditName: Bool
     let editName: () -> Void
 
     var body: some View {
@@ -129,10 +210,22 @@ private struct Header: View {
                     .foregroundStyle(Theme.text)
             }
             Spacer()
-            Button(action: editName) {
-                Avatar(name: name, face: face, size: 40)
+            if canEditName {
+                Button(action: editName) {
+                    Avatar(name: name, face: face, size: 40)
+                        .frame(minWidth: 44, minHeight: 44)
+                        .contentShape(Rectangle())
+                }
+                .accessibilityLabel("Change offline name: \(name ?? "not set")")
+            } else {
+                HStack(spacing: 10) {
+                    Text(name ?? "").font(Theme.sans(14, .semiBold)).foregroundStyle(Theme.text)
+                        .lineLimit(1)
+                    Avatar(name: name, face: face, size: 40)
+                }
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel("Microsoft account: \(name ?? "")")
             }
-            .accessibilityLabel("Player name: \(name ?? "not set")")
         }
         .padding(.horizontal, 20)
         .frame(height: 62)
@@ -186,8 +279,40 @@ private struct PlayPage: View {
     @ObservedObject var head: SkinHead
     @ObservedObject var account: MicrosoftAccount
     let editName: () -> Void
+    let availableWidth: CGFloat
+    @Environment(\.dynamicTypeSize) private var typeSize
 
     var body: some View {
+        Group {
+            if availableWidth >= 760 && !typeSize.isAccessibilitySize {
+                HStack(alignment: .top, spacing: 24) {
+                    VStack(alignment: .leading, spacing: 24) {
+                        GameCard(link: link, device: device, spacious: true)
+                        if needsFiles { GameFilesCard(download: download, missing: true) }
+                        WorldsSection(link: link)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .topLeading)
+                    VStack(alignment: .leading, spacing: 16) {
+                        if let last = link.worlds.first { ContinueCard(world: last, link: link) }
+                        identity
+                        AccountCard(account: account)
+                    }
+                    .frame(width: min(340, availableWidth * 0.34), alignment: .topLeading)
+                }
+            } else {
+                compact
+            }
+        }
+        .animation(.easeInOut(duration: 0.25), value: link.phase)
+        .animation(.easeInOut(duration: 0.25), value: link.worlds)
+    }
+
+    private var identity: some View {
+        PlayerCard(name: account.profile?.name ?? player.name, face: head.face,
+                   signedIn: account.profile != nil, edit: editName)
+    }
+
+    private var compact: some View {
         VStack(alignment: .leading, spacing: 16) {
             GameCard(link: link, device: device)
             if needsFiles {
@@ -196,12 +321,10 @@ private struct PlayPage: View {
             if let last = link.worlds.first {
                 ContinueCard(world: last, link: link)
             }
-            AccountCard(account: account)
             WorldsSection(link: link)
-            PlayerCard(name: player.name, face: head.face, edit: editName)
+            identity
+            AccountCard(account: account)
         }
-        .animation(.easeInOut(duration: 0.25), value: link.phase)
-        .animation(.easeInOut(duration: 0.25), value: link.worlds)
     }
 
     /// The game said it has nothing to load, or, before it starts, there are no game files to start it with.
@@ -214,10 +337,11 @@ private struct PlayPage: View {
 private struct GameCard: View {
     @ObservedObject var link: GameLink
     @ObservedObject var device: DeviceStatus
+    var spacious = false
 
     var body: some View {
         VStack(spacing: 0) {
-            Hero(version: link.version)
+            Hero(version: link.version, spacious: spacious)
             VStack(spacing: 12) {
                 StatusChips(link: link, device: device)
                 PlayButton(link: link)
@@ -232,6 +356,7 @@ private struct GameCard: View {
 
 private struct Hero: View {
     let version: String
+    var spacious = false
     /// Picked once per showing, as the title screen picks one per start.
     @State private var splash = Splash.pick()
 
@@ -245,7 +370,7 @@ private struct Hero: View {
             .padding(.vertical, 6)
             .background(Color(red: 16 / 255, green: 13 / 255, blue: 32 / 255, opacity: 0.8), in: RoundedRectangle(cornerRadius: 4))
             VStack(alignment: .leading, spacing: 6) {
-                Text("Horizon").font(Theme.pixel(44)).foregroundStyle(Theme.text)
+                Text("Horizon").font(Theme.pixel(spacious ? 56 : 44)).foregroundStyle(Theme.text)
                     .overlay(alignment: .topTrailing) {
                         if let splash {
                             Splash(text: splash)
@@ -261,8 +386,9 @@ private struct Hero: View {
             .padding(.top, 35)
             Spacer(minLength: 0)
         }
-        .padding(20)
-        .frame(maxWidth: .infinity, minHeight: 214, maxHeight: 214, alignment: .topLeading)
+        .padding(spacious ? 28 : 20)
+        .frame(maxWidth: .infinity, alignment: .topLeading)
+        .frame(height: spacious ? 292 : 214, alignment: .topLeading)
         .background {
             Kit.image("pixel-sunset")
                 .resizable()
@@ -320,6 +446,7 @@ private struct PlayButton: View {
                 .animation(.easeOut(duration: 0.3), value: fill)
             }
             .buttonStyle(PressStyle())
+            .accessibilityIdentifier("launcher-play-button")
             .disabled(missing || link.launching != nil)
             if link.launching != nil {
                 Button("Cancel") { link.cancelLaunch() }
@@ -377,6 +504,7 @@ private struct ContinueCard: View {
 private struct PlayerCard: View {
     let name: String?
     let face: UIImage?
+    let signedIn: Bool
     let edit: () -> Void
 
     var body: some View {
@@ -388,9 +516,11 @@ private struct PlayerCard: View {
                     .lineLimit(1)
             }
             Spacer(minLength: 0)
-            Button(action: edit) {
-                Text("Change").font(Theme.sans(12, .semiBold)).foregroundStyle(Theme.accentText)
-                    .frame(minWidth: 44, minHeight: 44)
+            if !signedIn {
+                Button(action: edit) {
+                    Text("Change").font(Theme.sans(12, .semiBold)).foregroundStyle(Theme.accentText)
+                        .frame(minWidth: 44, minHeight: 44)
+                }
             }
         }
         .padding(14)
