@@ -107,6 +107,9 @@ address. The script then checks, from both sides, what a guest's game used to ge
              it once; an iron door stays shut (#869).
 - push:      a cow standing in the guest pushes it just clear of the cow (the guest's own client
              pushes it, as in vanilla), not ever faster across the ground.
+- player-passthrough: server team collision rules gate player impulses; with pushing disabled,
+             the guest remains still beside another player and walks through its body.
+
 - eat:       holding right click with bread, the guest's own screen plays the eating (the item in use
              counts up) and the server eats one loaf and feeds the guest.
 - consume-release: the host and the guest each cancel eating a golden apple and drinking milk from
@@ -303,7 +306,7 @@ SERVER_THREAD = True
 CHECKS = ['tab', 'self', 'armour', 'nametags', 'walls', 'chest', 'crafting', 'spawned', 'sign', 'damage', 'mobs', 'hazards', 'pvp',
           'arrows', 'kills', 'leave', 'hurt', 'looks', 'leads', 'respawn', 'containers', 'feedback', 'titles', 'chat', 'styles',
           'commands', 'recipes', 'machines', 'brewing', 'loom', 'stonecutter', 'grindstone', 'anvil', 'smithing',
-          'enchanting', 'beacon', 'crafter', 'lectern', 'cartography', 'trials', 'clicks', 'sleep', 'predict', 'push',
+          'enchanting', 'beacon', 'crafter', 'lectern', 'cartography', 'trials', 'clicks', 'sleep', 'predict', 'push', 'player-passthrough',
           'piston-push', 'piston-slime', 'eat', 'eating', 'xp', 'objects', 'projectiles', 'thrown', 'sparks', 'hud', 'sidebar', 'border', 'particles',
           'worn', 'blast', 'barter', 'deflect', 'fireball', 'light', 'time', 'swings', 'cracks', 'plates', 'effects',
           'portals', 'distance', 'growth', 'doors', 'flight', 'ladder', 'boats', 'minecarts', 'frames', 'hands',
@@ -2784,6 +2787,85 @@ def check_push(host, guest, out):
     assert nx < x, f'the cow did not push the guest west: {detail}'
     assert moved < 1.5, f'the cow pushed the guest too far: {detail}'
     return detail
+
+
+def check_player_passthrough(host, guest, out):
+    """Real team packets -> remote player pushes, with idle and walking controls."""
+    teams = ('passthrough_a', 'passthrough_b')
+    result = {'samples': []}
+    x, y, z = (math.floor(v) for v in pos_of(host))
+    x, z = x + 0.5, z + 0.5
+    original = {g.name: pos_of(g) for g in (host, guest)}
+    def command(text):
+        host('command', command=text)
+    def place(offset=0.3):
+        # Separate first so rule updates cannot push actors during setup.
+        command(f'tp {host.player} {x + 4} {y} {z}')
+        guest('command', command=f'tp @s {x} {y} {z}')
+        guest.until(lambda: pos_of(guest),
+                    lambda p: math.hypot(p[0] - x, p[2] - z) < 0.01, ticks=80)
+        command(f'tp {host.player} {x + offset} {y} {z}')
+        # Wait for the host teleport to be visible on the guest's actual
+        # entity tracker. A loose bound permits legitimate Always impulses
+        # during acknowledgement, without accepting the old far-away body.
+        guest.until(lambda: remote(guest)['player_positions'],
+                    lambda positions: any(abs(p[0] - (x + offset)) < 0.9
+                                          and abs(p[2] - z) < 0.1 for p in positions), ticks=80)
+    try:
+        for game in (host, guest):
+            game.raw('release')
+            game('command', command='gamemode survival')
+            game('command', command='effect clear @s')
+        command(f'fill {math.floor(x) - 6} {y - 1} {math.floor(z) - 4} {math.floor(x) + 6} {y - 1} {math.floor(z) + 4} minecraft:stone')
+        command(f'fill {math.floor(x) - 6} {y} {math.floor(z) - 4} {math.floor(x) + 6} {y + 4} {math.floor(z) + 4} minecraft:air')
+        for team in teams:
+            command(f'team add {team}')
+        # The selective-rule names follow Team.CollisionRule's vanilla predicate:
+        # pushOwnTeam excludes allies; pushOtherTeams excludes non-allies.
+        for rule, same, pushes in [('never', True, False), ('always', True, True),
+                                   ('pushOwnTeam', True, False), ('pushOwnTeam', False, True),
+                                   ('pushOtherTeams', False, False), ('pushOtherTeams', True, True)]:
+            command(f'tp {host.player} {x + 4} {y} {z}')
+            for team in teams:
+                command(f'team modify {team} collisionRule {rule}')
+            command(f'team join {teams[0]} {GUEST_NAME}')
+            command(f'team join {teams[0] if same else teams[1]} {host.player}')
+            guest.wait(10)
+            membership = server_reply(guest, f'team list {teams[0]}', GUEST_NAME, 'member(s)')
+            place()
+            # One ctl script keeps sampling inside the 50-tick observation window.
+            states = guest.script([line for _ in range(10) for line in ('wait 5', 'state')], every=True)
+            players = [state['player'] for state in states if state.get('player')]
+            assert players, f'no movement samples for {rule}/{same}'
+            drift = max(math.hypot(p['position'][0] - x, p['position'][2] - z) for p in players)
+            speed = max(math.hypot(p['velocity'][0], p['velocity'][2]) for p in players)
+            row = {'rule': rule, 'same_team': same, 'expect_push': pushes, 'team_members': membership,
+                   'drift': drift, 'max_speed': speed,
+                   'positions': [p['position'] for p in players]}
+            result['samples'].append(row)
+            (out / 'player-passthrough-trace.json').write_text(json.dumps(result, indent=2) + '\n')
+            assert drift > 0.05 if pushes else drift < 0.025, f'player push rule mismatch: {row}'
+        # With pushing disabled, walk through the other body rather than merely
+        # standing still alongside it. The host is 1.5 blocks along the route.
+        for team in teams:
+            command(f'team modify {team} collisionRule never')
+        place(1.5)
+        guest.raw('look-at', x + 6, y + 1.62, z)
+        walked = guest.script(['key w down', 'wait 30', 'key w up', 'state'])['player']
+        result['walk'] = {'from': [x, y, z], 'other_body_x': x + 1.5, 'to': walked['position']}
+        assert walked['position'][0] > x + 2.2, f'player body blocked walking: {result}'
+        (out / 'player-passthrough-trace.json').write_text(json.dumps(result, indent=2) + '\n')
+        return result
+    finally:
+        for game in (host, guest):
+            game.raw('release')
+        for team in teams:
+            command(f'team remove {team}')
+        for game in (host, guest):
+            px, py, pz = original[game.name]
+            game('command', command=f'tp @s {px} {py} {pz}')
+
+
 def check_eat(host, guest, out):
     guest('command', command='gamemode survival')
     guest('command', command='clear @s')
@@ -4960,7 +5042,7 @@ CHECK_FNS = {'tab': check_tab, 'self': check_self, 'armour': check_armour,
              'cartography': check_cartography, 'hurt': check_hurt, 'commands': check_commands,
              'recipes': check_recipes, 'trials': check_trials, 'walls': check_walls,
              'effects': check_effects, 'portals': check_portals, 'distance': check_distance,
-             'clicks': check_clicks, 'sleep': check_sleep, 'push': check_push, 'piston-push': check_piston_push,
+             'clicks': check_clicks, 'sleep': check_sleep, 'push': check_push, 'player-passthrough': check_player_passthrough, 'piston-push': check_piston_push,
              'piston-slime': check_piston_slime,
              'eat': check_eat, 'eating': check_eating, 'xp': check_xp,
              'objects': check_objects, 'projectiles': check_projectiles, 'blast': check_blast,
