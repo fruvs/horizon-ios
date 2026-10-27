@@ -1152,6 +1152,36 @@ impl OptionsUi {
         self.settings_search.focused
             && matches!(self.page(), Page::Video | Page::Controls | Page::KeyBinds)
     }
+    /// A search box of this screen has the keyboard: the language page's, the video and controls pages'
+    /// (`settings_search_active`), or the pack screen's. A phone shows its system keyboard while this is
+    /// true and puts it away with it, as `winit`'s fields need an IME to be allowed.
+    pub fn typing(&self) -> bool {
+        if self.settings_search_active() {
+            return true;
+        }
+        match self.page() {
+            Page::Language => self.language_search.focused,
+            Page::Packs => self
+                .pack_screen
+                .as_ref()
+                .is_some_and(|p| p.search_focused()),
+            _ => false,
+        }
+    }
+    /// The search box that has the keyboard, on the current page (GUI pixels), so a phone can tell a finger
+    /// on the field from one on the rest of the screen.
+    pub fn focused_rect(&self) -> Option<[f32; 4]> {
+        let search = if self.page() == Page::Language {
+            &self.language_search
+        } else if self.settings_search_active() {
+            &self.settings_search
+        } else if self.page() == Page::Packs {
+            return self.pack_screen.as_ref().and_then(|p| p.search_rect());
+        } else {
+            return None;
+        };
+        Some([search.x, search.y, search.width, search.height])
+    }
     pub fn page(&self) -> Page {
         *self.stack.last().unwrap_or(&Page::Main)
     }
@@ -2464,6 +2494,21 @@ impl OptionsUi {
         }
         let (widgets, top, bottom, content) = self.layout(s, size.0, size.1);
         let mut events = Vec::new();
+        if !drag && self.page() == Page::Language {
+            // LanguageScreen's search box: a press inside it focuses it (the caret shows and a phone's
+            // keyboard comes up), anywhere else takes the focus away. Silent, as vanilla's rows are.
+            let search = &mut self.language_search;
+            let was = search.focused;
+            search.focused = ui::hovered((x, y), search.x, search.y, search.width, search.height);
+            if search.focused {
+                if !was {
+                    search.reset_blink();
+                }
+                search.click(atlas, x, false, false);
+                self.scroll = 0.0;
+                return events;
+            }
+        }
         if !drag && matches!(self.page(), Page::Video | Page::Controls | Page::KeyBinds) {
             let search = &mut self.settings_search;
             search.focused = ui::hovered((x, y), search.x, search.y, search.width, search.height);

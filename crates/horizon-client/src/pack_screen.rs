@@ -781,6 +781,17 @@ impl PackScreen {
     pub fn search_focused(&self) -> bool {
         self.confirm.is_none() && self.focus == Focus::Search
     }
+    /// The search box's box on screen, once laid out (GUI pixels).
+    pub fn search_rect(&self) -> Option<[f32; 4]> {
+        self.search_focused().then_some({
+            [
+                self.search.x as f32,
+                self.search.y as f32,
+                self.search.width as f32,
+                self.search.height as f32,
+            ]
+        })
+    }
     /// Resize (`Screen.init` on a new size: `repositionElements`).
     pub fn resize(&mut self, m: &Measure, width: i32, height: i32) {
         self.width = width;

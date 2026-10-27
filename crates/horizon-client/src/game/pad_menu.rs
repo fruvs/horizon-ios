@@ -92,6 +92,9 @@ pub(super) struct MenuCursor {
     osk_dismissed: bool,
     /// The system's keyboard was asked for (iOS: `sync_system_keyboard`).
     system_keyboard: bool,
+    /// The player put the system's keyboard away with the touch controls' keyboard button: the field keeps
+    /// its focus and text, and the keyboard stays down until the focus moves or the button is pressed again.
+    system_keyboard_hidden: bool,
 }
 
 impl Game<'_> {
@@ -895,33 +898,91 @@ impl Game<'_> {
 
     // ---- text fields ----
 
-    /// A text field anywhere has focus: `pad_typing`'s, or a title screen's (a server's name and address, a
-    /// world's name, the world search).
+    /// A text field anywhere has focus: `pad_typing`'s, a title screen's (a server's name and address, a
+    /// world's name, the world search), or an options page's search box (the language page's included).
     pub(super) fn field_focused(&mut self) -> bool {
         let title_field = self
             .title
             .as_mut()
             .is_some_and(|t| t.focused_field().is_some());
-        self.dialog_text_focused() || (!self.dialog_open() && (title_field || self.pad_typing()))
+        self.dialog_text_focused()
+            || (!self.dialog_open()
+                && (title_field
+                    || self.pad_typing()
+                    || (self.screen == Screen::Options && self.ui.options.typing())))
+    }
+
+    /// The focused field's box (GUI pixels), where the screen can say: a title screen's field or an options
+    /// page's search box. `None` for the rest (chat, a sign), which the touch controls leave alone.
+    pub(super) fn focused_field_rect(&self) -> Option<[f32; 4]> {
+        if self.dialog_open() {
+            return None;
+        }
+        if self.screen == Screen::Options {
+            return self.ui.options.focused_rect();
+        }
+        self.title.as_ref()?.focused_rect(self.gui_size())
     }
 
     /// Ask for the system's keyboard again, whatever the last request did: a request iOS ignored (it can,
     /// while a touch is being handled) is otherwise never repeated, as `sync_system_keyboard` only asks on a
-    /// change. The touch controls' keyboard button.
+    /// change. The touch controls' keyboard button, when the keyboard is down.
     pub(super) fn show_system_keyboard(&mut self) {
         self.pad.menu.osk = None;
         self.pad.menu.system_keyboard = true;
+        self.pad.menu.system_keyboard_hidden = false;
         if let Some(window) = &self.window {
             window.set_ime_allowed(false);
             window.set_ime_allowed(true);
         }
     }
 
+    /// Put the system's keyboard away while the field keeps its focus and text: the touch controls' keyboard
+    /// button, when the keyboard is up, and a finger landing outside the focused field.
+    pub(super) fn hide_system_keyboard(&mut self) {
+        if !self.pad.menu.system_keyboard {
+            return;
+        }
+        self.pad.menu.system_keyboard = false;
+        self.pad.menu.system_keyboard_hidden = true;
+        if let Some(window) = &self.window {
+            window.set_ime_allowed(false);
+        }
+    }
+
+    /// The touch controls' keyboard button: it brings the system's keyboard up, and puts it away again.
+    pub(super) fn toggle_system_keyboard(&mut self) {
+        if self.pad.menu.system_keyboard {
+            self.hide_system_keyboard();
+        } else {
+            self.show_system_keyboard();
+        }
+    }
+
+    /// The system's keyboard is up.
+    pub(super) fn system_keyboard_up(&self) -> bool {
+        self.pad.menu.system_keyboard
+    }
+
+    /// The player put the system's keyboard away, the field still focused.
+    pub(super) fn system_keyboard_hidden(&self) -> bool {
+        self.pad.menu.system_keyboard_hidden
+    }
+
     /// iPhone and iPad have no keyboard until one is asked for: it comes up while a text field has focus (a
     /// server's address, chat, a sign...) and Horizon's own is not open over it, and goes away with the focus.
-    /// winit types its keys into the window as `KeyboardInput`, which the fields already read.
+    /// A player who put it away keeps it away until the focus moves. winit types its keys into the window as
+    /// `KeyboardInput`, which the fields already read.
     pub(super) fn sync_system_keyboard(&mut self) {
-        let want = cfg!(target_os = "ios") && self.field_focused() && self.pad.menu.osk.is_none();
+        let focused = self.field_focused();
+        if !focused {
+            // The next field to take the focus asks for the keyboard again.
+            self.pad.menu.system_keyboard_hidden = false;
+        }
+        let want = cfg!(target_os = "ios")
+            && focused
+            && self.pad.menu.osk.is_none()
+            && !self.pad.menu.system_keyboard_hidden;
         if want != self.pad.menu.system_keyboard {
             self.pad.menu.system_keyboard = want;
             if let Some(window) = &self.window {

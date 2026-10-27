@@ -1463,8 +1463,9 @@ impl Title {
             edit.shortcut(shortcut, board);
         });
     }
-    /// The focused field's box on screen.
-    fn focused_rect(&self, (w, h): (f32, f32)) -> Option<[f32; 4]> {
+    /// The focused field's box on screen (GUI pixels), for the caret's drag and for the touch controls,
+    /// which put the system's keyboard away when a finger lands outside of it.
+    pub fn focused_rect(&self, (w, h): (f32, f32)) -> Option<[f32; 4]> {
         let x = (w / 2.0).floor() - 100.0;
         match &self.mode {
             Mode::Select { .. } if self.search_focused => Some([x, 21.0, 200.0, 20.0]),
@@ -1472,7 +1473,7 @@ impl Title {
             Mode::Create { focus, options, .. } => create_world::field_rect(w, h, options.tab)
                 .filter(|(id, _)| id == focus)
                 .map(|(_, rect)| rect),
-            Mode::Multiplayer(screen) => screen.focused_box((w, h)),
+            Mode::Multiplayer(screen) => screen.focused_rect((w, h)),
             _ => None,
         }
     }

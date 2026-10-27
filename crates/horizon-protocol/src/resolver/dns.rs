@@ -2,6 +2,10 @@
 //! turn, one UDP try of 1 s (`com.sun.jndi.dns.timeout.retries` = 1), TCP when
 //! the reply is truncated, and the answer's first SRV record. By hand, so the
 //! game needs no async runtime or resolver library for one question.
+//!
+//! iOS gives an app no resolv.conf to read, so the phone asks the system's own
+//! resolver instead (`query_srv_system`) and the rest goes unused there.
+#![cfg_attr(target_os = "ios", allow(dead_code))]
 use std::{
     io::{Read, Write},
     net::{SocketAddr, TcpStream, UdpSocket},
@@ -110,6 +114,15 @@ fn ask_tcp(server: SocketAddr, query: &[u8], timeout: Duration) -> Option<Vec<u8
     let mut buf = vec![0; u16::from_be_bytes(len) as usize];
     stream.read_exact(&mut buf).ok()?;
     Some(buf)
+}
+
+/// The phone's question, through the system resolver ([`horizon_dnssd`]): its
+/// rdata is a record's own, with no compression to follow.
+#[cfg(target_os = "ios")]
+pub(super) fn query_srv_system(name: &str) -> Option<(String, u16)> {
+    let rdata = horizon_dnssd::query_srv(name, horizon_dnssd::TIMEOUT)?;
+    let port = u16::from_be_bytes([*rdata.get(4)?, *rdata.get(5)?]);
+    Some((read_name(&rdata, 6)?.0, port))
 }
 
 /// A recursive SRV question (RFC 1035 §4.1) for an absolute name.

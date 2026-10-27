@@ -21,6 +21,10 @@ sha2 = "0.10"
 [target.'cfg(windows)'.dependencies]
 ipconfig = "0.3.4"
 
+# iOS gives an app no resolv.conf: the SRV question goes to the system resolver.
+[target.'cfg(target_os = "ios")'.dependencies]
+horizon-dnssd = { path = "../horizon-dnssd" }
+
 # Its own name, not `probe`: Cargo copies every crate's examples into one target/<profile>/examples.
 [[example]]
 name = "protocol_probe"

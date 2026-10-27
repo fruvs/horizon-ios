@@ -322,8 +322,20 @@ impl Game<'_> {
                         log::warn!("Horizon: touch close: {e}");
                     }
                 } else if on_keyboard {
-                    self.show_system_keyboard();
+                    self.toggle_system_keyboard();
                 } else {
+                    // A finger outside the field the keyboard belongs to puts the system's keyboard away, as
+                    // it would on any phone (and one on the field brings it back after the button hid it);
+                    // the tap still does what it was on.
+                    match self.focused_field_rect() {
+                        Some(rect) if touch::hit_rect(rect, at) => {
+                            if self.system_keyboard_hidden() {
+                                self.show_system_keyboard();
+                            }
+                        }
+                        Some(_) if self.system_keyboard_up() => self.hide_system_keyboard(),
+                        _ => {}
+                    }
                     self.touch_pointer(event_loop, at);
                 }
                 self.touch.menu = Some(MenuFinger {

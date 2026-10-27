@@ -1432,6 +1432,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "horizon-dnssd"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "horizon-dualsense"
 version = "0.1.0"
 dependencies = [
@@ -1559,6 +1566,7 @@ dependencies = [
  "flate2",
  "getrandom 0.3.4",
  "horizon-core",
+ "horizon-dnssd",
  "horizon-world",
  "ipconfig",
  "serde_json",
