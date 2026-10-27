@@ -215,7 +215,7 @@ impl Touches {
         out
     }
 
-    /// A finger lifted (or the system cancelled it).
+    /// A finger lifted.
     pub fn end(&mut self, id: u64) -> Vec<Out> {
         let Some(i) = self.fingers.iter().position(|f| f.id == id) else {
             return Vec::new();
@@ -226,6 +226,13 @@ impl Touches {
             Kind::World { dragged: false, .. } => vec![Out::Tap],
             Kind::World { .. } => Vec::new(),
         }
+    }
+
+    /// UIKit cancelled a finger: release its holds without interpreting it as a tap.
+    pub fn cancel(&mut self, id: u64) -> Vec<Out> {
+        let mut out = self.end(id);
+        out.retain(|o| *o != Out::Tap);
+        out
     }
 
     /// Once a frame: a finger on the world that has stayed still long enough starts mining.
@@ -249,14 +256,7 @@ impl Touches {
     /// Every finger lifted at once (a screen opened over the game).
     pub fn release_all(&mut self) -> Vec<Out> {
         let ids: Vec<u64> = self.fingers.iter().map(|f| f.id).collect();
-        ids.into_iter()
-            .flat_map(|id| {
-                let mut out = self.end(id);
-                // A cancelled touch is no tap.
-                out.retain(|o| *o != Out::Tap);
-                out
-            })
-            .collect()
+        ids.into_iter().flat_map(|id| self.cancel(id)).collect()
     }
 
     /// A finger holds this button down (drawn pressed).

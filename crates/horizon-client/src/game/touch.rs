@@ -107,13 +107,15 @@ impl Game<'_> {
         )
     }
 
-    pub(super) fn touch_keyboard_used(&mut self) {
+    pub(super) fn touch_keyboard_used(&mut self, event_loop: &ActiveEventLoop) {
+        self.touch_release_menu(event_loop);
         if horizon_gamecontroller::keyboard_connected() {
             self.touch.hardware.keyboard();
         }
     }
 
-    pub(super) fn touch_mouse_used(&mut self) {
+    pub(super) fn touch_mouse_used(&mut self, event_loop: &ActiveEventLoop) {
+        self.touch_release_menu(event_loop);
         self.touch.hardware.mouse();
     }
 
@@ -135,8 +137,19 @@ impl Game<'_> {
             touch.location.x as f32 / batch.scale,
             touch.location.y as f32 / batch.scale,
         );
-        if self.touch.menu.is_some() || !self.touch_playing() {
-            self.touch_menu(event_loop, touch.id, touch.phase, at);
+        let playing = self.touch_playing();
+        if playing {
+            // Loading or keyboard navigation can consume a menu finger's release.
+            // That old finger must not route a new world touch back into the menu.
+            self.touch_release_menu(event_loop);
+        } else {
+            if touch.phase == TouchPhase::Cancelled {
+                if self.touch.menu.as_ref().is_some_and(|f| f.id == touch.id) {
+                    self.touch_release_menu(event_loop);
+                }
+            } else {
+                self.touch_menu(event_loop, touch.id, touch.phase, at);
+            }
             return Ok(());
         }
         let layout = touch::layout(batch.width, batch.height);
@@ -146,7 +159,8 @@ impl Game<'_> {
                 self.touch.fingers.start(touch.id, at, now, &layout)
             }
             TouchPhase::Moved => self.touch.fingers.moved(touch.id, at, &layout),
-            TouchPhase::Ended | TouchPhase::Cancelled => self.touch.fingers.end(touch.id),
+            TouchPhase::Ended => self.touch.fingers.end(touch.id),
+            TouchPhase::Cancelled => self.touch.fingers.cancel(touch.id),
         };
         self.touch_act(out, batch.scale)
     }
@@ -161,8 +175,12 @@ impl Game<'_> {
         if !self.touch_shown() {
             return;
         }
-        self.touch_menu_frame(event_loop);
         let playing = self.touch_playing();
+        if playing {
+            self.touch_release_menu(event_loop);
+        } else {
+            self.touch_menu_frame(event_loop);
+        }
         let out = if playing {
             let now = self.touch_now();
             self.touch.fingers.frame(now)
@@ -377,8 +395,18 @@ impl Game<'_> {
         }
     }
 
-    /// Once a loop iteration: the menu finger's press, a frame after it went down, and its release, a frame
-    /// after the press once it has lifted.
+    /// Abandon a menu gesture when another input device or the world takes over.
+    /// A missing UIKit end event must neither latch all later fingers nor create a click.
+    fn touch_release_menu(&mut self, event_loop: &ActiveEventLoop) {
+        if let Some(finger) = self.touch.menu.take()
+            && finger.pressed
+            && !finger.closed
+        {
+            self.touch_button(event_loop, false);
+        }
+    }
+
+    /// Advance the delayed menu press/release after drawing the pointer.
     fn touch_menu_frame(&mut self, event_loop: &ActiveEventLoop) {
         let Some(finger) = self.touch.menu.as_mut() else {
             return;

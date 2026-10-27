@@ -12584,7 +12584,7 @@ impl ApplicationHandler for Game<'_> {
             && let PhysicalKey::Code(key) = event.physical_key
         {
             if event.state == ElementState::Pressed {
-                self.touch_keyboard_used();
+                self.touch_keyboard_used(event_loop);
                 self.physical_keys.insert(key);
             } else {
                 self.physical_keys.remove(&key);
@@ -13541,7 +13541,7 @@ impl ApplicationHandler for Game<'_> {
             event_loop.exit();
         }
     }
-    fn device_event(&mut self, _: &ActiveEventLoop, _: DeviceId, event: DeviceEvent) {
+    fn device_event(&mut self, event_loop: &ActiveEventLoop, _: DeviceId, event: DeviceEvent) {
         if horizon_ios_launcher::covered() {
             return;
         }
@@ -13551,7 +13551,7 @@ impl ApplicationHandler for Game<'_> {
                 | DeviceEvent::Button { .. }
                 | DeviceEvent::MouseWheel { .. }
         ) {
-            self.touch_mouse_used();
+            self.touch_mouse_used(event_loop);
         }
         if self.pending_save.is_none()
             && self.captured
