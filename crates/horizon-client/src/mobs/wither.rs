@@ -96,7 +96,7 @@ pub fn make_invulnerable(m: &mut Mob) {
 pub fn powered(m: &Mob) -> bool {
     m.health <= m.attrs.max_health / 2.0
 }
-fn head_pos(m: &Mob, i: usize) -> [f64; 3] {
+pub fn head_pos(m: &Mob, i: usize) -> [f64; 3] {
     if i == 0 {
         return [m.position.x, m.position.y + 3.0, m.position.z];
     }
@@ -169,6 +169,26 @@ fn target_pos(w: &MobWorld, id: i32) -> Option<([f64; 3], f64, bool)> {
             .map(|s| ([s.position.x, s.position.y, s.position.z], s.eye_y, false)),
     }
 }
+/// `WitherBoss.aiStep` on a client of a server: the smoke about each head
+/// (`radius` 0.3 of the wither's scale, which is 1 here). The heads' turning
+/// and the coloured particles need the server's targets and invulnerable
+/// ticks, which a client is not sent.
+pub fn client_smoke(m: &mut Mob, events: &mut Vec<MobEvent>) {
+    for i in 0..3 {
+        let h = head_pos(m, i);
+        let r = &mut m.random;
+        let at = [
+            h[0] + r.next_gaussian() * 0.3,
+            h[1] + r.next_gaussian() * 0.3,
+            h[2] + r.next_gaussian() * 0.3,
+        ];
+        events.push(MobEvent::ParticleAt {
+            kind: "smoke",
+            at,
+            velocity: [0.0; 3],
+        });
+    }
+}
 /// `WitherBoss.aiStep` after `super.aiStep()`: the side heads turn, smoke
 /// rises from the heads (the particle offsets are drawn on the server too).
 pub fn ai_step(m: &mut Mob, w: &MobWorld, events: &mut Vec<MobEvent>) {
@@ -221,6 +241,7 @@ pub fn custom_server_ai_step(m: &mut Mob, w: &MobWorld, events: &mut Vec<MobEven
             events.push(MobEvent::Explode(
                 [m.position.x, m.eye_y(), m.position.z],
                 7.0,
+                m.species(),
             ));
             // Global level event 1023.
             if !m.silent {

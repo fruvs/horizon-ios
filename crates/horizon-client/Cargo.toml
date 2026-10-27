@@ -65,6 +65,7 @@ horizon-gamecontroller = { path = "../horizon-gamecontroller" }
 horizon-ios-launcher = { path = "../horizon-ios-launcher" }
 # HTTPS to the Minecraft services (online-mode session join).
 ureq = { version = "2", default-features = false, features = ["tls"] }
+unicode-bidi = "0.3.18"
 
 [target.'cfg(any(target_os = "macos", target_os = "windows", target_os = "linux", target_os = "android"))'.dependencies]
 # The system clipboard, on the four targets arboard has a backend for. It is gated rather than plain

@@ -56,6 +56,8 @@ fn main() {
     };
     if !help {
         logging::init(&home, thread);
+        // The log's first line names the build, so a bug report that carries the log says which one it was.
+        log::info!("Horizon {}", crash::version());
         crash::install(home.clone(), side);
     }
     // What a phone does with its files before the game looks for them, once the log can say so.
