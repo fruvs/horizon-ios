@@ -24,8 +24,9 @@ env:
 
 jobs:
   ipa:
-    # macos-14 stopped being handed out on 2026-10-27 ("not acquired by Runner of type hosted"); MAC_RUNNER overrides.
-    runs-on: ${{ vars.MAC_RUNNER || 'macos-15' }}
+    # The native launcher uses the iOS 26 SDK (Liquid Glass). macos-15 defaults to Xcode 16.4.
+    # MAC_RUNNER remains available for a maintainer-provided runner with Xcode 26 or newer.
+    runs-on: ${{ vars.MAC_RUNNER || 'macos-26' }}
     timeout-minutes: 90
     defaults:
       run:
@@ -34,6 +35,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+      - name: Check the Apple toolchain
+        run: bash tools/ci/ios-toolchain.sh
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ env.IOS_TARGET }}
@@ -73,6 +76,14 @@ jobs:
           rm -rf game-xcode && mkdir -p game-xcode/Payload
           cp -a build-ios/HorizonGame.app game-xcode/Payload/
           ( cd game-xcode && zip -qry ../Horizon-game-unsigned.ipa Payload )
+      - name: Preserve the Xcode failure log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-xcode-failure-log
+          path: xcode-game-build.log
+          retention-days: 7
+          if-no-files-found: ignore
       - uses: actions/upload-artifact@v4
         with:
           name: horizon-ios-game
