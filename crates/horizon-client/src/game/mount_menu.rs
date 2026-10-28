@@ -516,7 +516,7 @@ impl Game<'_> {
         let atlas = &self.gui.atlas;
         let lookup = |name: &str| atlas.sprites.get(name).map(|r| [r.u0, r.v0, r.u1, r.v1]);
         let mut verts = Vec::new();
-        horizon_client::mobs::render::render_with(
+        let _ = horizon_client::mobs::render::render_with(
             &m,
             1.0,
             camera,

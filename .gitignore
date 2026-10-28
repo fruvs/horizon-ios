@@ -51,3 +51,9 @@
 
 # Release-only compiled original exporter bundle.
 /exporters/
+
+# Generated simulator-only launcher preview project.
+/packaging/ios/Preview/LauncherPreview.xcodeproj/
+
+# Xcode intermediate products generated beside the iOS project.
+/packaging/ios/build/

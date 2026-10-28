@@ -60,7 +60,11 @@ impl Game<'_> {
     }
 
     pub(super) fn sync_airplay(&mut self) {
-        let screen = horizon_airplay::screen(true, self.splitscreen.active);
+        if self.splitscreen.guest {
+            return;
+        }
+        let screen =
+            horizon_airplay::screen(!horizon_ios_launcher::covered(), self.splitscreen.active);
         sync(
             self.renderer.as_mut(),
             self.window.as_ref(),

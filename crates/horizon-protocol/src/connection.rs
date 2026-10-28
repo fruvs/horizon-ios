@@ -187,12 +187,25 @@ fn ipv4_first(mut addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
     addrs.sort_by_key(SocketAddr::is_ipv6);
     addrs
 }
+/// An independent close-only handle, usable while either connection half is
+/// blocked in I/O (including before login has finished).
+pub struct ShutdownHandle(Stream);
+impl ShutdownHandle {
+    pub fn shutdown(&self) {
+        self.0.shutdown();
+    }
+}
+
 /// Both halves before the split.
 pub struct Connection {
     pub reader: ConnReader,
     pub writer: ConnWriter,
 }
 impl Connection {
+    pub fn shutdown_handle(&self) -> Result<ShutdownHandle> {
+        Ok(ShutdownHandle(self.reader.stream.try_clone()?))
+    }
+
     pub fn connect(host: &str, port: u16, timeout: Duration) -> Result<Self> {
         let addrs: Vec<_> = (host, port)
             .to_socket_addrs()

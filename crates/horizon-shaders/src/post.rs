@@ -16,7 +16,8 @@ use crate::config::{self, Config};
 use crate::custom::Custom;
 use crate::{GbuffersInputs, Macros, Pack, Preprocessed, Program, Properties, Target};
 use crate::{
-    eval_condition, preprocess, translate_composite, translate_gbuffers, translate_shadow,
+    ImageDefinition, preprocess, translate_composite_with_images, translate_gbuffers_with_images,
+    translate_shadow_with_images,
 };
 
 /// Which group of 2.1 a program belongs to.
@@ -216,6 +217,9 @@ pub struct PostProgram {
 pub struct Post {
     /// False when a required pass failed or requested geometry has no usable program.
     pub complete: bool,
+    pub images: Vec<ImageDefinition>,
+    pub textures: Vec<crate::TextureDefinition>,
+    pub compute: crate::Compute,
     /// The folder the programs came from: `""` for `shaders` itself, else `world0`...
     pub folder: String,
     pub programs: Vec<PostProgram>,
@@ -309,8 +313,34 @@ pub fn load_post(
     macros: &Macros,
     inputs: &GameInputs,
 ) -> Post {
+    let (images, mut image_errors) = match ImageDefinition::parse(properties) {
+        Ok(images) => (images, Vec::new()),
+        Err(errors) => (Vec::new(), errors),
+    };
+    let textures = match crate::TextureDefinition::load(pack, properties) {
+        Ok(textures) => textures,
+        Err(errors) => {
+            image_errors.extend(errors);
+            Vec::new()
+        }
+    };
+    let compute = crate::load_compute(pack, folder, properties, macros, &images);
+    // Compute-only passes carry the same buffer and shadow configuration constants as
+    // raster stages. Only successfully loaded, enabled stages contribute their settings.
+    let mut config = Config::default();
+    for program in &compute.programs {
+        let path = if folder.is_empty() {
+            format!("{}.csh", program.name)
+        } else {
+            format!("{folder}/{}.csh", program.name)
+        };
+        config.read(&preprocess(pack, &path, macros));
+    }
     let mut post = Post {
-        complete: true,
+        complete: image_errors.is_empty() && compute.complete,
+        compute,
+        images: images.clone(),
+        textures,
         folder: folder.to_owned(),
         programs: Vec::new(),
         deferred_pre: flips(properties, "deferred_pre"),
@@ -337,8 +367,8 @@ pub fn load_post(
         translucent_late: false,
         particles_late: false,
         custom: Custom::parse(properties),
-        config: Config::default(),
-        notes: Vec::new(),
+        config,
+        notes: image_errors,
     };
     let mut loader = Loader {
         pack,
@@ -361,7 +391,9 @@ pub fn load_post(
             _ => Target::Buffers,
         };
         for name in names {
-            if let Some(p) = loader.load(name, group, |v, f| translate_composite(v, f, target)) {
+            if let Some(p) = loader.load(name, group, |v, f, _config| {
+                translate_composite_with_images(v, f, target, &images)
+            }) {
                 loader.post.programs.push(p);
             }
         }
@@ -375,8 +407,9 @@ pub fn load_post(
             if let Some(test) = test {
                 inputs.alpha_test = test;
             }
-            loader.load(name.to_string(), group, |v, f| {
-                translate_gbuffers(v, f, Target::Buffers, &inputs)
+            loader.load(name.to_string(), group, |v, f, config| {
+                apply_terrain_lighting(&mut inputs, properties, config);
+                translate_gbuffers_with_images(v, f, Target::Buffers, &inputs, &images)
             })
         })
     };
@@ -618,6 +651,12 @@ fn load_shadow(
     let reads = (post.programs.iter())
         .chain(gbuffers.into_iter().flatten())
         .flat_map(|p| &p.program.interface.samplers)
+        .chain(
+            post.compute
+                .programs
+                .iter()
+                .flat_map(|p| &p.program.interface.samplers),
+        )
         .any(|s| SHADOW_SAMPLERS.contains(&s.name.as_str()));
     let forced = match loader.properties.get("shadow.enabled").map(str::trim) {
         Some("true") => Some(true),
@@ -629,11 +668,12 @@ fn load_shadow(
     if !on {
         return;
     }
+    let images = loader.post.images.clone();
     let names =
         std::iter::once("shadowcomp".to_owned()).chain((1..=99).map(|n| format!("shadowcomp{n}")));
     for name in names {
-        let program = loader.load(name, Group::ShadowComp, |v, f| {
-            translate_composite(v, f, Target::Buffers)
+        let program = loader.load(name, Group::ShadowComp, |v, f, _config| {
+            translate_composite_with_images(v, f, Target::Buffers, &images)
         });
         loader.post.shadow_comp.extend(program);
     }
@@ -641,8 +681,10 @@ fn load_shadow(
     let mut load = |names: &[&str], inputs: Option<&GbuffersInputs>| {
         let inputs = inputs?;
         names.iter().find_map(|name| {
-            let p = loader.load(name.to_string(), Group::Shadow, |v, f| {
-                translate_shadow(v, f, inputs)
+            let mut inputs = inputs.clone();
+            let p = loader.load(name.to_string(), Group::Shadow, |v, f, config| {
+                apply_terrain_lighting(&mut inputs, properties, config);
+                translate_shadow_with_images(v, f, &inputs, &images)
             });
             p.map(|mut p| {
                 p.blend = blend(properties, &p.name).flatten();
@@ -684,6 +726,20 @@ fn load_shadow(
     loader.post.shadow_only_lit_blocks = only_lit;
 }
 
+/// Apply pack policy only to vertex inputs which explicitly opt into terrain lighting.
+fn apply_terrain_lighting(inputs: &mut GbuffersInputs, properties: &Properties, config: &Config) {
+    if let Some(policy) = &mut inputs.terrain_lighting {
+        let flag = |key: &str, default| match properties.get(key).map(str::trim) {
+            Some("true") => true,
+            Some("false") => false,
+            _ => default,
+        };
+        policy.old_lighting = flag("oldLighting", true);
+        policy.separate_ao = flag("separateAo", false);
+        policy.ao_strength = config.ambient_occlusion_level;
+    }
+}
+
 struct Loader<'a> {
     pack: &'a Pack,
     folder: &'a str,
@@ -700,7 +756,11 @@ impl Loader<'_> {
         &mut self,
         name: String,
         group: Group,
-        translate: impl FnOnce(&Preprocessed, &Preprocessed) -> Result<Program, Vec<crate::Error>>,
+        translate: impl FnOnce(
+            &Preprocessed,
+            &Preprocessed,
+            &Config,
+        ) -> Result<Program, Vec<crate::Error>>,
     ) -> Option<PostProgram> {
         let path = |ext: &str| match self.folder {
             "" => format!("{name}.{ext}"),
@@ -752,7 +812,10 @@ impl Loader<'_> {
             notes.push(format!("{name}: skipped"));
             return None;
         }
-        let program = match translate(&vertex, &fragment) {
+        let mut config = self.post.config.clone();
+        config.read(&vertex);
+        config.read(&fragment);
+        let program = match translate(&vertex, &fragment, &config) {
             Ok(p) => p,
             Err(errors) => {
                 if fullscreen {
@@ -767,8 +830,7 @@ impl Loader<'_> {
                 return None;
             }
         };
-        self.post.config.read(&vertex);
-        self.post.config.read(&fragment);
+        self.post.config = config;
         let mut buffers = config::draw_buffers(&fragment).unwrap_or_else(|| (0..8).collect());
         if group.shadow() {
             // Output n writes shadowcolor n (6.3); there are two.
@@ -822,27 +884,7 @@ fn enabled(
     macros: &Macros,
     switches: &BTreeSet<String>,
 ) -> bool {
-    let keys = [
-        format!("program.{folder}/{name}.enabled"),
-        format!("program.{name}.enabled"),
-    ];
-    let Some(expr) = keys.iter().find_map(|k| properties.get(k)) else {
-        return true;
-    };
-    // `true`/`false` as numbers, every other name as `defined(name)`, then the `#if` arithmetic.
-    let mut condition = String::new();
-    for token in crate::macros::lex(expr) {
-        match token {
-            "true" => condition.push('1'),
-            "false" => condition.push('0'),
-            t if switches.contains(t) => condition.push('1'),
-            t if t.starts_with(|c: char| c.is_alphabetic() || c == '_') => {
-                condition.push_str(&format!("defined({t})"));
-            }
-            t => condition.push_str(t),
-        }
-    }
-    eval_condition(&condition, macros).ok() != Some(0)
+    properties.program_enabled(folder, name, macros, switches)
 }
 
 /// `blend.<program>`: `Some(None)` for `off`, `Some(factors)`, or `None` when absent or not
@@ -887,6 +929,253 @@ mod tests {
     const FSH: &str = "#version 120\nuniform sampler2D colortex0;\nvarying vec2 uv;\n\
                        void main() {\n/* DRAWBUFFERS:3 */\n\
                        gl_FragData[0] = texture2D(colortex0, uv);\n}\n";
+
+    fn terrain_policy(program: &Program) -> Option<crate::TerrainLighting> {
+        let literal = |name| {
+            let (_, constant) = program
+                .vertex
+                .constants
+                .iter()
+                .find(|(_, c)| c.name.as_deref() == Some(name))?;
+            match program.vertex.global_expressions[constant.init] {
+                naga::Expression::Literal(value) => Some(value),
+                _ => None,
+            }
+        };
+        let naga::Literal::Bool(old_lighting) = literal("hz_old_lighting")? else {
+            return None;
+        };
+        let naga::Literal::Bool(separate_ao) = literal("hz_separate_ao")? else {
+            return None;
+        };
+        let naga::Literal::F32(ao_strength) = literal("hz_ao_strength")? else {
+            return None;
+        };
+        Some(crate::TerrainLighting {
+            old_lighting,
+            separate_ao,
+            ao_strength,
+        })
+    }
+
+    #[test]
+    #[ignore = "needs HORIZON_TEST_TERRAIN_PACK, a local pack never committed"]
+    fn real_pack_terrain_lighting_policy() {
+        let path =
+            std::env::var_os("HORIZON_TEST_TERRAIN_PACK").expect("HORIZON_TEST_TERRAIN_PACK");
+        let pack = Pack::open(std::path::Path::new(&path)).unwrap();
+        let mut macros = Macros::standard();
+        macros.undef("MC_OS_MAC");
+        macros.define("MC_OS_OTHER", "");
+        let folder = dimension_folder(&pack, 0);
+        let properties = Properties::from_pack(&pack, &folder, &macros);
+        let plain = GbuffersInputs {
+            declarations: "layout(location=0) in vec3 hz_v_pos;".into(),
+            body: "hz_Vertex=vec4(hz_v_pos,1.0);hz_Color=vec4(1.0);".into(),
+            attributes: vec![("mc_Entity".into(), "vec4(-1.0)".into())],
+            ..Default::default()
+        };
+        let terrain = GbuffersInputs {
+            terrain_lighting: Some(crate::TerrainLighting::default()),
+            ..plain.clone()
+        };
+        let inputs = GameInputs {
+            terrain: Some(terrain),
+            sky: Some(plain.clone()),
+            celestial: Some(plain.clone()),
+            entities: Some(plain.clone()),
+            clouds: Some(plain.clone()),
+            weather: Some(plain.clone()),
+            hand: Some(plain),
+        };
+        let post = load_post(&pack, &folder, &properties, &macros, &inputs);
+        assert!(post.complete, "{:?} {:?}", post.notes, post.compute.notes);
+        let expected = Some(crate::TerrainLighting {
+            old_lighting: properties.get("oldLighting") != Some("false"),
+            separate_ao: properties.get("separateAo") == Some("true"),
+            ao_strength: post.config.ambient_occlusion_level,
+        });
+        for pass in [&post.terrain, &post.water, &post.shadow, &post.shadow_water]
+            .into_iter()
+            .flatten()
+        {
+            let actual = terrain_policy(&pass.program);
+            println!("{}: {:?}", pass.name, actual);
+            assert_eq!(actual, expected);
+        }
+        println!(
+            "complete={} ambientOcclusionLevel={}",
+            post.complete, post.config.ambient_occlusion_level
+        );
+    }
+
+    #[test]
+    fn terrain_lighting_policy_follows_options_dimension_and_shadow_fallbacks() {
+        let mut files = Vec::<(String, String)>::new();
+        for (folder, mode, ao) in [("world0", 2, 0.375), ("world-1", 1, 0.75)] {
+            files.push((
+                format!("shaders/{folder}/settings.glsl"),
+                format!(
+                    "#define POLICY_MODE {mode} //[1 2]\nconst float ambientOcclusionLevel={ao};"
+                ),
+            ));
+            // Only basic exists: terrain and water must carry the policy through fallback.
+            for name in ["gbuffers_basic", "shadow"] {
+                files.push((format!("shaders/{folder}/{name}.vsh"), "#version 120\n#include \"settings.glsl\"\nvoid main(){gl_Position=gl_Vertex;gl_FrontColor=gl_Color;}".into()));
+                files.push((
+                    format!("shaders/{folder}/{name}.fsh"),
+                    "#version 120\n#include \"settings.glsl\"\nvoid main(){gl_FragColor=gl_Color;}"
+                        .into(),
+                ));
+            }
+        }
+        files.push(("shaders/shaders.properties".into(), "shadow.enabled=true\n#if POLICY_MODE == 2\noldLighting=false\nseparateAo=true\n#else\noldLighting=true\nseparateAo=false\n#endif".into()));
+        let borrowed: Vec<_> = files
+            .iter()
+            .map(|(path, code)| (path.as_str(), code.as_str()))
+            .collect();
+        let pack = Pack::from_zip_bytes("lighting-policy", zip(&borrowed)).unwrap();
+        let macros = Macros::standard();
+        let plain = GbuffersInputs {
+            body: "hz_Vertex=vec4(0.0,0.0,0.0,1.0);hz_Color=vec4(1.0);".into(),
+            ..Default::default()
+        };
+        let terrain = GbuffersInputs {
+            terrain_lighting: Some(crate::TerrainLighting::default()),
+            ..plain.clone()
+        };
+        let inputs = GameInputs {
+            terrain: Some(terrain),
+            sky: Some(plain.clone()),
+            celestial: Some(plain.clone()),
+            entities: Some(plain.clone()),
+            clouds: Some(plain.clone()),
+            weather: Some(plain.clone()),
+            hand: Some(plain),
+        };
+        for (dimension, old_lighting, separate_ao, ao_strength) in
+            [(0, false, true, 0.375), (-1, true, false, 0.75)]
+        {
+            let folder = dimension_folder(&pack, dimension);
+            let properties = Properties::from_pack(&pack, &folder, &macros);
+            let post = load_post(&pack, &folder, &properties, &macros, &inputs);
+            assert!(post.complete, "{:?}", post.notes);
+            let expected = Some(crate::TerrainLighting {
+                old_lighting,
+                separate_ao,
+                ao_strength,
+            });
+            for pass in [&post.terrain, &post.water, &post.shadow, &post.shadow_water] {
+                assert_eq!(terrain_policy(&pass.as_ref().unwrap().program), expected);
+            }
+            assert_eq!(post.terrain.as_ref().unwrap().name, "gbuffers_basic");
+            assert!(terrain_policy(&post.sky.as_ref().unwrap().program).is_none());
+            assert!(terrain_policy(&post.entities.as_ref().unwrap().program).is_none());
+            assert!(terrain_policy(&post.shadow_entities.as_ref().unwrap().program).is_none());
+            assert_eq!(
+                inputs.terrain.as_ref().unwrap().terrain_lighting,
+                Some(crate::TerrainLighting::default())
+            );
+            let defaults = Properties::parse("shadow.enabled=true", &macros);
+            let post = load_post(&pack, &folder, &defaults, &macros, &inputs);
+            assert_eq!(
+                terrain_policy(&post.terrain.unwrap().program),
+                Some(crate::TerrainLighting {
+                    old_lighting: true,
+                    separate_ao: false,
+                    ao_strength
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn compute_shadow_inputs_enable_the_shadow_pass_only_when_live_and_enabled() {
+        let macros = Macros::standard();
+        for sampler in ["shadowcolor0", "shadowcolor1", "shadowtex0", "shadowtex1"] {
+            let code = format!(
+                "#version 430\nlayout(local_size_x=1) in;\nuniform sampler2D {sampler};\nlayout(rgba8) writeonly uniform image2D result_img;\nvoid main(){{imageStore(result_img,ivec2(0),texelFetch({sampler},ivec2(0),0));}}"
+            );
+            let pack =
+                Pack::from_zip_bytes("compute-shadow", zip(&[("shaders/composite.csh", &code)]))
+                    .unwrap();
+            let properties = Properties::parse(
+                "image.result_img=resultTex rgba rgba8 unsigned_byte true false 8 8",
+                &macros,
+            );
+            let post = load_post(&pack, "", &properties, &macros, &GameInputs::default());
+            assert!(
+                post.complete,
+                "{sampler}: {:?} {:?}",
+                post.notes, post.compute.notes
+            );
+            assert_eq!(post.compute.programs.len(), 1);
+            assert!(post.shadow_pass, "{sampler}");
+            let disabled = Properties::parse("program.composite.enabled=false", &macros);
+            let post = load_post(&pack, "", &disabled, &macros, &GameInputs::default());
+            assert!(post.complete);
+            assert!(!post.shadow_pass);
+            assert!(post.compute.programs.is_empty());
+            let forced = Properties::parse(
+                "shadow.enabled=false\nimage.result_img=resultTex rgba rgba8 unsigned_byte true false 8 8",
+                &macros,
+            );
+            assert!(!load_post(&pack, "", &forced, &macros, &GameInputs::default()).shadow_pass);
+        }
+        let pack = Pack::from_zip_bytes("unused-shadow", zip(&[("shaders/composite.csh", "#version 430\nlayout(local_size_x=1) in;uniform sampler2D shadowtex0;void main(){}")])).unwrap();
+        let post = load_post(
+            &pack,
+            "",
+            &Properties::default(),
+            &macros,
+            &GameInputs::default(),
+        );
+        assert!(post.complete, "{:?}", post.compute.notes);
+        assert!(!post.shadow_pass);
+    }
+
+    #[test]
+    fn compute_only_stage_configuration_uses_the_selected_folder() {
+        let base = "#version 430\nlayout(local_size_x=1) in;\n/* const int colortex4Format=RGBA8; */\nvoid main(){}";
+        let code = "#version 430\nlayout(local_size_x=1) in;\n/* const int colortex4Format=RGBA16F; */\nconst bool colortex4Clear=false;\nconst bool colortex4MipmapEnabled=true;\nconst int shadowMapResolution=512;\nuniform sampler2D gdepth;\nuniform sampler2D colortex4;\nlayout(rgba8) writeonly uniform image2D result_img;\nvoid main(){imageStore(result_img,ivec2(0),texelFetch(gdepth,ivec2(0),0)+texelFetch(colortex4,ivec2(0),0));}";
+        let pack = Pack::from_zip_bytes(
+            "compute-config",
+            zip(&[
+                ("shaders/composite.csh", base),
+                ("shaders/world-1/composite.csh", code),
+            ]),
+        )
+        .unwrap();
+        let macros = Macros::standard();
+        let properties = Properties::parse(
+            "image.result_img=resultTex rgba rgba8 unsigned_byte true false 8 8",
+            &macros,
+        );
+        let post = load_post(
+            &pack,
+            "world-1",
+            &properties,
+            &macros,
+            &GameInputs::default(),
+        );
+        assert!(post.complete, "{:?} {:?}", post.notes, post.compute.notes);
+        assert_eq!(
+            post.config.buffers[4].format,
+            crate::Format::parse("RGBA16F").unwrap()
+        );
+        assert!(!post.config.buffers[4].clear);
+        assert!(post.config.buffers[4].mipmap);
+        assert_eq!(
+            post.config.buffers[1].format,
+            crate::Format::parse("RGBA32F").unwrap()
+        );
+        assert_eq!(post.config.shadow.resolution, 512);
+        let disabled = Properties::parse("program.world-1/composite.enabled=false", &macros);
+        let post = load_post(&pack, "world-1", &disabled, &macros, &GameInputs::default());
+        assert!(post.complete);
+        assert_eq!(post.config.buffers[4].format, crate::Format::RGBA8);
+        assert!(post.config.buffers[4].clear);
+    }
 
     #[test]
     fn incomplete_fullscreen_passes_fail_safely() {

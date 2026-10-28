@@ -111,7 +111,7 @@ impl GpuTimer {
                 .contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS))
             .then(|| {
                 let module = crate::gfx::shader_module(
-                    &device,
+                    device,
                     wgpu::ShaderModuleDescriptor {
                         label: Some("Frame timestamp"),
                         source: wgpu::ShaderSource::Wgsl(MARKER.into()),
@@ -119,7 +119,7 @@ impl GpuTimer {
                 );
                 Markers {
                     start: crate::gfx::compute_pipeline(
-                        &device,
+                        device,
                         &wgpu::ComputePipelineDescriptor {
                             label: Some("Frame timestamp"),
                             layout: None,
@@ -266,7 +266,7 @@ pub(super) fn end_pipeline(
     format: wgpu::TextureFormat,
 ) -> wgpu::RenderPipeline {
     crate::gfx::render_pipeline(
-        &device,
+        device,
         &wgpu::RenderPipelineDescriptor {
             label: Some("Frame timestamp"),
             layout: None,

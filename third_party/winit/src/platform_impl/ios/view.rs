@@ -19,7 +19,7 @@ use super::window::WinitUIWindow;
 use crate::dpi::PhysicalPosition;
 use crate::event::{ElementState, Event, Force, KeyEvent, Touch, TouchPhase, WindowEvent};
 use crate::keyboard::{
-    Key, KeyCode, KeyLocation, ModifiersState, NamedKey, NativeKeyCode, PhysicalKey,
+    Key, KeyCode, KeyLocation, ModifiersState, NamedKey, PhysicalKey,
 };
 use crate::platform_impl::platform::DEVICE_ID;
 use crate::platform_impl::KeyEventExtra;
@@ -77,16 +77,6 @@ declare_class!(
 
             let window = self.window().unwrap();
             let window_bounds = window.bounds();
-            let screen = window.screen();
-            let screen_space = screen.coordinateSpace();
-            let screen_frame = self.convertRect_toCoordinateSpace(window_bounds, &screen_space);
-            let scale_factor = screen.scale();
-            let size = crate::dpi::LogicalSize {
-                width: screen_frame.size.width as f64,
-                height: screen_frame.size.height as f64,
-            }
-            .to_physical(scale_factor as f64);
-
             // If the app is started in landscape, the view frame and window bounds can be mismatched.
             // The view frame will be in portrait and the window bounds in landscape. So apply the
             // window bounds to the view frame to make it consistent.
@@ -94,6 +84,15 @@ declare_class!(
             if view_frame != window_bounds {
                 self.setFrame(window_bounds);
             }
+
+            // Match Window::inner_size, the Metal layer, and view-local input.
+            // Query after correcting the frame so rotation cannot report old bounds.
+            let bounds = self.bounds();
+            let size = crate::dpi::LogicalSize {
+                width: bounds.size.width as f64,
+                height: bounds.size.height as f64,
+            }
+            .to_physical(self.contentScaleFactor() as f64);
 
             app_state::handle_nonuser_event(
                 mtm,
@@ -130,12 +129,9 @@ declare_class!(
             );
             let scale_factor = scale_factor as f64;
             let bounds = self.bounds();
-            let screen = window.screen();
-            let screen_space = screen.coordinateSpace();
-            let screen_frame = self.convertRect_toCoordinateSpace(bounds, &screen_space);
             let size = crate::dpi::LogicalSize {
-                width: screen_frame.size.width as f64,
-                height: screen_frame.size.height as f64,
+                width: bounds.size.width as f64,
+                height: bounds.size.height as f64,
             };
             let window_id = RootWindowId(window.id());
             app_state::handle_nonuser_events(
@@ -554,7 +550,8 @@ impl WinitView {
         let mut touch_events = Vec::new();
         let os_supports_force = app_state::os_capabilities().force_touch;
         for touch in touches {
-            let logical_location = touch.locationInView(None);
+            // Hover, direct touches and trackpad clicks share the render-view origin.
+            let logical_location = touch.locationInView(Some(self));
             let touch_type = touch.r#type();
             if touch_type == UITouchType::IndirectPointer && self.ivars().mouse.captured() {
                 continue;
@@ -757,37 +754,40 @@ impl WinitView {
         let window = self.window().unwrap();
         let window_id = RootWindowId(window.id());
         let mtm = MainThreadMarker::new().unwrap();
-        // send individual events for each character
+        // Both software typing and hardware navigation can arrive via insertText:.
+        // Decode navigation tokens before expanding genuine text into characters.
         app_state::handle_nonuser_events(
             mtm,
-            text.to_string().chars().flat_map(|c| {
-                let text = smol_str::SmolStr::from_iter([c]);
-                // Emit both press and release events
-                [ElementState::Pressed, ElementState::Released].map(|state| {
-                    EventWrapper::StaticEvent(Event::WindowEvent {
-                        window_id,
-                        event: WindowEvent::KeyboardInput {
-                            event: KeyEvent {
-                                text: if state == ElementState::Pressed {
-                                    Some(text.clone())
-                                } else {
-                                    None
+            super::hardware_keyboard::insert_text_keys(&text.to_string())
+                .into_iter()
+                .flat_map(|(physical_key, logical_key)| {
+                    let text = match &logical_key {
+                        Key::Character(text) => Some(text.clone()),
+                        _ => None,
+                    };
+                    [ElementState::Pressed, ElementState::Released].map(|state| {
+                        EventWrapper::StaticEvent(Event::WindowEvent {
+                            window_id,
+                            event: WindowEvent::KeyboardInput {
+                                event: KeyEvent {
+                                    text: if state == ElementState::Pressed {
+                                        text.clone()
+                                    } else {
+                                        None
+                                    },
+                                    state,
+                                    location: KeyLocation::Standard,
+                                    repeat: false,
+                                    logical_key: logical_key.clone(),
+                                    physical_key,
+                                    platform_specific: KeyEventExtra {},
                                 },
-                                state,
-                                location: KeyLocation::Standard,
-                                repeat: false,
-                                logical_key: Key::Character(text.clone()),
-                                physical_key: PhysicalKey::Unidentified(
-                                    NativeKeyCode::Unidentified,
-                                ),
-                                platform_specific: KeyEventExtra {},
+                                is_synthetic: false,
+                                device_id: DEVICE_ID,
                             },
-                            is_synthetic: false,
-                            device_id: DEVICE_ID,
-                        },
+                        })
                     })
-                })
-            }),
+                }),
         );
     }
 

@@ -1,9 +1,10 @@
-//! Boats, minecarts, armor stands, item frames and paintings on a server's
+//! Boats, minecarts, armor stands, item frames, paintings and fence knots on a server's
 //! client (`ClientPacketListener.handleAddEntity`, `handleSetEntityData`,
 //! `handleSetEquipment`): the server simulates them, the client places them
 //! where it says and interpolates their moves like a mob's.
 use super::Game;
 use horizon_client::entities::{ArmorStand, Cushion, ItemFrame, Painting};
+use horizon_client::mobs::leash::Holder;
 use horizon_core::geometry::Vec3;
 use horizon_protocol::entity_data::Value;
 use std::sync::Arc;
@@ -24,7 +25,17 @@ impl Game<'_> {
         let at = Vec3::new(position[0], position[1], position[2]);
         let block = position.map(|v| v.floor() as i32);
         self.remove_remote_object(id);
-        if kind == "minecraft:text_display" {
+        if kind == "minecraft:leash_knot" {
+            // A lead that came before its knot waits as a mob holder with the
+            // knot's id (handleEntityLinkPacket's delayed holder); now it can
+            // be tied to the fence.
+            self.remote_knots.insert(id, block);
+            for m in &mut self.mobs {
+                if m.extra.leash == Some(Holder::Mob(id)) {
+                    m.extra.leash = Some(Holder::Knot(block));
+                }
+            }
+        } else if kind == "minecraft:text_display" {
             self.text_displays.insert(
                 id as i32,
                 super::text_displays::RemoteTextDisplay::new(position, yaw),
@@ -123,11 +134,7 @@ impl Game<'_> {
                 let Some(f) = self.item_frames.iter_mut().find(|f| f.id == id) else {
                     continue;
                 };
-                match (index, value) {
-                    (8, Value::Id(d)) => f.facing = (*d).clamp(0, 5) as u8,
-                    (10, Value::Int(r)) => f.rotation = r.rem_euclid(8) as u8,
-                    _ => {}
-                }
+                apply_frame_metadata(f, *index, value);
                 if let Some(item) = item {
                     f.item = item;
                 }
@@ -153,6 +160,10 @@ impl Game<'_> {
                     }
                     (3, Value::Bool(visible)) => a.name_visible = *visible,
                     (9, Value::Float(health)) => a.health = *health,
+                    // ArmorStand.DATA_HEAD_POSE to DATA_RIGHT_LEG_POSE.
+                    (16..=21, Value::Floats(r)) if r.len() == 3 => {
+                        a.pose[usize::from(index - 16)] = [r[0], r[1], r[2]];
+                    }
                     // ArmorStand.DATA_CLIENT_FLAGS.
                     (15, Value::Byte(flags)) => {
                         a.small = flags & 1 != 0;
@@ -304,16 +315,19 @@ impl Game<'_> {
     /// Every object a server sent (a new connection, level or dimension).
     pub(super) fn clear_remote_objects(&mut self) {
         self.text_displays.clear();
+        self.remote_knots.clear();
         self.carts.clear();
         self.boats.clear();
         self.armor_stands.clear();
         self.cushions.clear();
         self.item_frames.clear();
         self.paintings.clear();
+        self.bolts.clear();
     }
 
     pub(super) fn remove_remote_object(&mut self, id: u32) {
         self.text_displays.remove(&(id as i32));
+        self.remote_knots.remove(&id);
         self.carts.retain(|c| c.id != id);
         self.boats.retain(|b| b.id != id);
         self.armor_stands.retain(|a| a.id != id);
@@ -321,5 +335,51 @@ impl Game<'_> {
         self.item_frames.retain(|f| f.id != id);
         self.paintings.retain(|p| p.id != id);
         self.bolts.retain(|b| b.id != id);
+    }
+}
+
+/// ItemFrame inherits Entity's shared flags, including invisibility. Updates
+/// are partial: unrelated metadata must leave the last visibility unchanged.
+fn apply_frame_metadata(frame: &mut ItemFrame, index: u8, value: &Value) {
+    match (index, value) {
+        (0, Value::Byte(flags)) => frame.invisible = flags & 0x20 != 0,
+        (8, Value::Id(direction)) => frame.facing = (*direction).clamp(0, 5) as u8,
+        (10, Value::Int(rotation)) => frame.rotation = rotation.rem_euclid(8) as u8,
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frame_visibility_follows_partial_metadata_and_can_be_reset() {
+        for glow in [false, true] {
+            let mut frame = ItemFrame {
+                id: 7,
+                pos: [0, 64, 0],
+                facing: 3,
+                glow,
+                item: None,
+                rotation: 0,
+                drop_chance: 1.0,
+                fixed: false,
+                invisible: false,
+                check_interval: 0,
+            };
+            apply_frame_metadata(&mut frame, 0, &Value::Byte(0x20));
+            assert!(frame.invisible);
+            apply_frame_metadata(&mut frame, 8, &Value::Id(4));
+            apply_frame_metadata(&mut frame, 10, &Value::Int(3));
+            assert!(frame.invisible);
+            assert_eq!((frame.facing, frame.rotation), (4, 3));
+            // Other shared flags do not imply invisibility.
+            apply_frame_metadata(&mut frame, 0, &Value::Byte(0x40));
+            assert!(!frame.invisible);
+            apply_frame_metadata(&mut frame, 0, &Value::Byte(0x20));
+            apply_frame_metadata(&mut frame, 0, &Value::Byte(0));
+            assert!(!frame.invisible);
+        }
     }
 }

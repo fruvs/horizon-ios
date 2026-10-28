@@ -9,7 +9,7 @@
 use crate::auth::AuthSession;
 use horizon_protocol::{
     PROTOCOL_VERSION,
-    connection::{ConnReader, ConnWriter, Connection, Counters},
+    connection::{ConnReader, ConnWriter, Connection, Counters, ShutdownHandle},
     crypto::{generate_secret, offline_uuid, server_hash},
     packets::{Empty, configuration as cfg, handshake, login, play},
     registry::Dynamic,
@@ -68,6 +68,9 @@ pub enum Event {
         host: String,
         port: i32,
     },
+    /// `ClientboundServerLinksPacket`: the links the pause menu's "Server
+    /// Links..." lists (ClientCommonPacketListenerImpl.handleServerLinks).
+    ServerLinks(Vec<cfg::ServerLink>),
     /// The connection ended. `from_server`: the server gave the reason (or
     /// the connection was refused for good), rather than the connection
     /// failing (auto-reconnect retries only failures and shutdowns).
@@ -77,7 +80,33 @@ pub enum Event {
     },
 }
 
+#[derive(Default)]
+struct Cancellation {
+    state: Mutex<(bool, Option<ShutdownHandle>)>,
+}
+impl Cancellation {
+    fn attach(&self, connection: &Connection) -> Result<(), String> {
+        let handle = connection.shutdown_handle().map_err(|e| e.to_string())?;
+        let mut state = self.state.lock().unwrap();
+        if state.0 {
+            handle.shutdown();
+            return Err("Connection cancelled".into());
+        }
+        state.1 = Some(handle);
+        Ok(())
+    }
+
+    fn cancel(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.0 = true;
+        if let Some(handle) = state.1.take() {
+            handle.shutdown();
+        }
+    }
+}
+
 pub struct Session {
+    cancellation: Arc<Cancellation>,
     events: Receiver<Event>,
     writer: Arc<Mutex<Option<ConnWriter>>>,
     /// The connection is in configuration (else in play). Changed only
@@ -142,6 +171,8 @@ impl Session {
         cookies: Option<Cookies>,
     ) -> Self {
         let (send, events) = channel();
+        let cancellation = Arc::new(Cancellation::default());
+        let thread_cancellation = cancellation.clone();
         let writer = Arc::new(Mutex::new(None));
         let configuring = Arc::new(AtomicBool::new(true));
         let counters = Arc::new(Mutex::new(None));
@@ -169,7 +200,9 @@ impl Session {
                     &thread_counters,
                     &thread_cookies,
                     transferred,
+                    &thread_cancellation,
                 );
+                thread_cancellation.cancel();
                 let from_server = result.is_ok();
                 let reason = result.unwrap_or_else(|e| e);
                 if let Some(w) = thread_writer.lock().unwrap().take() {
@@ -183,6 +216,7 @@ impl Session {
             .ok();
         let debug = std::env::var_os("HORIZON_NET_DEBUG").is_some();
         Self {
+            cancellation,
             events,
             writer,
             configuring,
@@ -260,12 +294,16 @@ impl Session {
         }
     }
     pub fn disconnect(&mut self) {
-        if let Some(w) = self.writer.lock().unwrap().take() {
-            w.shutdown();
-        }
-        if let Some(t) = self.thread.take() {
+        // Do not wait for DNS, connect, authentication, or a blocked writer.
+        // The close-only handle wakes login/play I/O; if connect is still in
+        // flight, attach closes its socket before it can send a handshake.
+        self.cancellation.cancel();
+        if let Some(t) = self.thread.take()
+            && t.is_finished()
+        {
             let _ = t.join();
         }
+        // An unfinished worker owns all of its inputs and exits independently.
     }
 }
 impl Drop for Session {
@@ -363,6 +401,7 @@ fn run(
     shared_counters: &Mutex<Option<Arc<Counters>>>,
     cookies: &Cookies,
     transferred: bool,
+    cancellation: &Cancellation,
 ) -> Result<String, String> {
     let (host, port, mut c) = if let Some(pipe) = local {
         (address.to_owned(), 0, Connection::local(pipe))
@@ -386,6 +425,7 @@ fn run(
         .map_err(|e| e.to_string())?;
         (host, port, c)
     };
+    cancellation.attach(&c)?;
     *shared_counters.lock().unwrap() = Some(c.reader.counters.clone());
     let e = |e: horizon_protocol::Error| e.to_string();
     c.send(
@@ -565,6 +605,9 @@ fn receive_play(
             play::Clientbound::StoreCookie(p) => {
                 cookies.lock().unwrap().insert(p.key, p.payload);
             }
+            play::Clientbound::ServerLinks(p) => {
+                let _ = send.send(Event::ServerLinks(p.links));
+            }
             // ClientCommonPacketListenerImpl.handleTransfer: the connection
             // ends and the game connects to the other address.
             play::Clientbound::Transfer(p) => {
@@ -643,6 +686,9 @@ fn configure(
             }
             cfg::Clientbound::StoreCookie(p) => {
                 cookies.lock().unwrap().insert(p.key, p.payload);
+            }
+            cfg::Clientbound::ServerLinks(p) => {
+                let _ = send.send(Event::ServerLinks(p.links));
             }
             cfg::Clientbound::Transfer(p) => {
                 let _ = send.send(Event::Transfer {
@@ -775,6 +821,84 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cancelling_stalled_login_closes_socket_without_waiting_for_worker() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let (ready, login_received) = channel();
+        let (closed, peer_closed) = channel();
+        let server = std::thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut connection = Connection::from_stream(socket).unwrap();
+            // Accept the handshake and Hello, then deliberately never reply.
+            connection.recv().unwrap();
+            connection.recv().unwrap();
+            ready.send(()).unwrap();
+            closed.send(connection.recv().is_err()).unwrap();
+        });
+        let mut session =
+            Session::connect(&address, "CancelTest", None, 8, Arc::new(Language::new()));
+        login_received.recv_timeout(Duration::from_secs(3)).unwrap();
+        // Login has not published the play/configuration writer yet.
+        assert!(session.writer.lock().unwrap().is_none());
+        let worker = session.thread.take().unwrap();
+        let start = std::time::Instant::now();
+        session.disconnect();
+        assert!(start.elapsed() < Duration::from_millis(500));
+        assert!(peer_closed.recv_timeout(Duration::from_secs(1)).unwrap());
+        server.join().unwrap();
+        worker.join().unwrap();
+        assert!(
+            !session
+                .poll()
+                .iter()
+                .any(|event| matches!(event, Event::Joined { .. }))
+        );
+    }
+
+    #[test]
+    fn disconnect_does_not_join_a_worker_still_waiting_for_startup() {
+        let (release, wait) = channel();
+        let (finished, done) = channel();
+        let worker = std::thread::spawn(move || {
+            let _ = wait.recv_timeout(Duration::from_secs(2));
+            let _ = finished.send(());
+        });
+        let (_, events) = channel();
+        let mut session = Session {
+            cancellation: Arc::new(Cancellation::default()),
+            events,
+            writer: Arc::new(Mutex::new(None)),
+            configuring: Arc::new(AtomicBool::new(true)),
+            thread: Some(worker),
+            address: "pending".into(),
+            name: "CancelTest".into(),
+            counters: Arc::new(Mutex::new(None)),
+            cookies: Cookies::default(),
+            debug: false,
+        };
+        let start = std::time::Instant::now();
+        session.disconnect();
+        let elapsed = start.elapsed();
+        let _ = release.send(());
+        done.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(elapsed < Duration::from_millis(500));
+    }
+
+    #[test]
+    fn cancellation_before_connect_finishes_rejects_and_closes_late_socket() {
+        let cancellation = Cancellation::default();
+        cancellation.cancel();
+        let (client, server) = horizon_protocol::connection::Pipe::pair();
+        let connection = Connection::local(client);
+        let mut peer = Connection::local(server);
+        assert!(cancellation.attach(&connection).is_err());
+        assert!(peer.recv().is_err());
+    }
+
+    #[test]
     fn pings_wait_behind_teleports_but_keepalives_do_not_wait_for_the_game() {
         let (client, server) = horizon_protocol::connection::Pipe::pair();
         let (mut reader, writer) = Connection::local(client).split();
@@ -828,9 +952,13 @@ mod tests {
     #[test]
     fn play_packets_wait_out_a_reconfiguration() {
         let (client, server) = horizon_protocol::connection::Pipe::pair();
-        let (mut reader, writer) = Connection::local(client).split();
+        let connection = Connection::local(client);
+        let cancellation = Arc::new(Cancellation::default());
+        cancellation.attach(&connection).unwrap();
+        let (mut reader, writer) = connection.split();
         let (send, events) = channel();
         let session = Session {
+            cancellation,
             events,
             writer: Arc::new(Mutex::new(Some(writer))),
             configuring: Arc::new(AtomicBool::new(false)),

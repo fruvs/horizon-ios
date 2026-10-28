@@ -92,7 +92,7 @@ impl Stars {
             }],
         });
         let shader = crate::gfx::shader_module(
-            &device,
+            device,
             wgpu::ShaderModuleDescriptor {
                 label: Some("Stars shader"),
                 source: wgpu::ShaderSource::Wgsl(include_str!("stars.wgsl").into()),
@@ -105,7 +105,7 @@ impl Stars {
         });
         let attributes = wgpu::vertex_attr_array![0 => Float32x3];
         let pipeline = crate::gfx::render_pipeline(
-            &device,
+            device,
             &wgpu::RenderPipelineDescriptor {
                 label: Some("Stars"),
                 layout: Some(&pipeline_layout),

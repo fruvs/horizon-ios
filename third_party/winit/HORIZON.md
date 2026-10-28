@@ -46,3 +46,11 @@ and https://developer.apple.com/videos/play/wwdc2026/278/.
 Named hardware navigation keys do not produce text, even when UIKit supplies symbolic
 UIKeyInput names. Their physical/logical key actions are retained; printable layout text
 and space continue to produce character input. Host regression tests cover this mapping.
+
+## Render-view coordinates
+
+`inner_size`, layout resize events and content-scale changes report the full render-view
+bounds multiplied by its content scale. Safe-area insets must not shrink the Metal drawable,
+which fills that view: doing so stretches the image and shifts rendered button locations away
+from their input regions after renderer recreation. Touches and indirect-pointer clicks use
+view-local coordinates, matching hover events, including across orientation changes.

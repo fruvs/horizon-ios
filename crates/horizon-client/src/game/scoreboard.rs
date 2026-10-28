@@ -139,8 +139,10 @@ impl Game<'_> {
             | Target::Painting(id)
             | Target::Boat(id)
             | Target::Cart(id)
+            | Target::Crystal(id)
+            | Target::Dragon(id)
             | Target::Other(id) => Some(uuid_text(self.uuid_for(id))),
-            // Orbs and projectiles are addressed by index and have no UUID here.
+            // Orbs and projectiles have no UUID here.
             Target::Orb(_) | Target::Projectile(_) => None,
         }
     }
@@ -188,7 +190,11 @@ impl Game<'_> {
             | Target::Cart(id)
             | Target::Other(id) => self.persist.raw.get(&id),
             Target::Player => self.level.player_extra.as_ref(),
-            Target::Guest(_) | Target::Orb(_) | Target::Projectile(_) => None,
+            Target::Guest(_)
+            | Target::Orb(_)
+            | Target::Projectile(_)
+            | Target::Crystal(_)
+            | Target::Dragon(_) => None,
         };
         match raw.and_then(|r| r.get("Tags")) {
             Some(Tag::List(l)) => l
@@ -449,11 +455,18 @@ impl Game<'_> {
 
     /// `Entity.getTeam` of a mob (a mob joins a team by its UUID).
     pub(super) fn mob_team(&self, id: u32) -> Option<&sb::Team> {
+        if let Some(remote) = &self.remote {
+            return remote.entity_team(&self.score.board, id);
+        }
         let uuid = self.persist.uuids.get(&id)?;
         self.score.board.players_team(&uuid_text(*uuid))
     }
     pub(super) fn player_team(&self) -> Option<&sb::Team> {
-        self.score.board.players_team(self.acting_player_name())
+        let name = self.remote.as_ref().map_or_else(
+            || self.acting_player_name(),
+            |remote| remote.profile_name.as_str(),
+        );
+        self.score.board.players_team(name)
     }
     /// The teams of the player and of the mobs on one (empty without teams).
     pub(super) fn mob_teams(&self) -> horizon_client::mobs::Teams<'_> {
@@ -464,10 +477,9 @@ impl Game<'_> {
         horizon_client::mobs::Teams {
             player: self.player_team(),
             mobs: self
-                .persist
-                .uuids
+                .mobs
                 .iter()
-                .filter_map(|(id, uuid)| Some((*id, board.players_team(&uuid_text(*uuid))?)))
+                .filter_map(|mob| Some((mob.id, self.mob_team(mob.id)?)))
                 .collect(),
         }
     }
@@ -677,7 +689,7 @@ impl Game<'_> {
         let objective = board.display_objective(sb::SLOT_LIST);
         let shown = tab_list::visible(
             key,
-            self.remote.is_none(),
+            self.has_singleplayer_server(),
             players.len(),
             objective.is_some(),
         );

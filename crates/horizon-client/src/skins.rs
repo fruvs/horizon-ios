@@ -126,20 +126,9 @@ pub fn unpack(value: &str, signature: Signature, valid_uris: &[&str]) -> Texture
 /// heads and mannequins read their profile this way, and `SkinManager` lets
 /// those textures be unsigned (`getInsecureSkinInformation`).
 pub fn profile_skin_url(profile: &serde_json::Value) -> Option<String> {
-    let value = profile
-        .get("properties")?
-        .as_array()?
-        .iter()
-        .find_map(|p| {
-            if p.get("name")?.as_str()? == "textures" {
-                p.get("value")?.as_str()
-            } else {
-                None
-            }
-        })?;
-    unpack(value, Signature::Unsigned, &TEXTURE_URIS).skin
+    let (value, signature) = parse_profile(profile).textures?;
+    unpack(&value, signature, &TEXTURE_URIS).skin
 }
-
 /// `profile_skin_url` on a block entity's `profile` NBT (`SkullBlockEntity`):
 /// the same `properties` list, held as a compound. A name-only profile (a
 /// string tag) has no properties and no skin URL.
@@ -174,11 +163,327 @@ pub fn profile_uuid_nbt(profile: &horizon_world::nbt::Tag) -> Option<u128> {
     }
 }
 
-fn nbt_text(tag: Option<&horizon_world::nbt::Tag>) -> Option<String> {
+pub(crate) fn nbt_text(tag: Option<&horizon_world::nbt::Tag>) -> Option<String> {
     match tag {
         Some(horizon_world::nbt::Tag::String(s)) => Some(s.to_string_lossy()),
         _ => None,
     }
+}
+
+/// `Either<String, UUID>`: the key a `Dynamic` `ResolvableProfile` resolves
+/// by (`ResolvableProfile.nameOrId`).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum NameOrId {
+    Name(String),
+    Id(u128),
+}
+
+/// `GameProfile` as `fetchProfile` returns it: the account's id, name and
+/// property map (its `textures` property is the skin).
+#[derive(Clone, Debug)]
+pub struct ResolvedProfile {
+    pub id: u128,
+    pub name: String,
+    /// `(name, value, signature)` properties.
+    pub properties: Vec<(String, String, Option<String>)>,
+}
+impl ResolvedProfile {
+    /// `SessionService.getPackedTextures`: the `textures` property.
+    pub fn textures(&self) -> Option<(String, Signature)> {
+        self.properties
+            .iter()
+            .find(|(n, _, _)| n == "textures")
+            .map(|(_, v, s)| {
+                (
+                    v.clone(),
+                    if s.is_some() {
+                        Signature::Signed
+                    } else {
+                        Signature::Unsigned
+                    },
+                )
+            })
+    }
+}
+
+/// Where a `Dynamic` profile's resolution stands (`resolveProfile`'s future).
+#[derive(Clone, Debug)]
+pub enum Resolve {
+    Pending,
+    /// The services' answer: `None` for no profile or no answer, which the
+    /// cache holds like any result (`Optional.empty`).
+    Done(Option<ResolvedProfile>),
+}
+
+/// `ProfileResolver.Cached`: resolves a `Dynamic` profile through the
+/// services — `profileCacheByName` asks `profiles`/`getByName` for the id,
+/// `profileCacheById` asks `session`/`getProfileById` for the profile —
+/// at most 256 entries kept 10 minutes after their last use, fetched on
+/// background threads.
+pub struct Resolver {
+    entries: std::collections::HashMap<NameOrId, Entry>,
+    done: std::sync::mpsc::Receiver<(NameOrId, Option<ResolvedProfile>)>,
+    send: std::sync::mpsc::Sender<(NameOrId, Option<ResolvedProfile>)>,
+    last_sweep: std::time::Instant,
+}
+struct Entry {
+    touched: std::time::Instant,
+    /// `None` while the fetch is in flight.
+    resolved: Option<Option<ResolvedProfile>>,
+}
+/// `ProfileResolver.Cached`'s cache bounds.
+const MAX_PROFILES: usize = 256;
+const PROFILE_TTL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// `StringUtil.isValidPlayerName` (the check `fetchByName` makes first).
+fn valid_player_name(name: &str) -> bool {
+    name.encode_utf16().count() <= 16 && name.encode_utf16().all(|c| c > 32 && c < 127)
+}
+
+/// `fetchByNameOrId`: `getByName` answers `{id, name}`; `getProfileById`
+/// (`fetchProfile(id, requireSecure)`) answers `{id, name, properties}` —
+/// asked `unsigned=false` so the `textures` property is signed.
+fn resolve_profile(key: &NameOrId, doc: &serde_json::Value) -> Option<ResolvedProfile> {
+    let id = match key {
+        NameOrId::Id(id) => *id,
+        NameOrId::Name(name) => {
+            let url = crate::auth::endpoint(doc, "profiles", "getByName")?
+                .replace("{name}", &name.to_lowercase());
+            let body = http_get(&url)?;
+            let v: serde_json::Value = serde_json::from_slice(&body).ok()?;
+            crate::auth::parse_uuid(v.get("id")?.as_str()?)?
+        }
+    };
+    let url = crate::auth::endpoint(doc, "session", "getProfileById")?
+        .replace("{profileId}", &format!("{id:032x}"));
+    let separator = if url.contains('?') { '&' } else { '?' };
+    let body = http_get(&format!("{url}{separator}unsigned=false"))?;
+    let v: serde_json::Value = serde_json::from_slice(&body).ok()?;
+    Some(ResolvedProfile {
+        id: crate::auth::parse_uuid(v.get("id")?.as_str()?)?,
+        name: v.get("name")?.as_str()?.to_owned(),
+        properties: v
+            .get("properties")?
+            .as_array()?
+            .iter()
+            .map(|p| {
+                Some((
+                    p.get("name")?.as_str()?.to_owned(),
+                    p.get("value")?.as_str()?.to_owned(),
+                    p.get("signature")
+                        .and_then(|s| s.as_str())
+                        .map(str::to_owned),
+                ))
+            })
+            .collect::<Option<Vec<_>>>()?,
+    })
+}
+
+impl Default for Resolver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+impl Resolver {
+    pub fn new() -> Self {
+        let (send, done) = std::sync::mpsc::channel();
+        Self {
+            entries: Default::default(),
+            done,
+            send,
+            last_sweep: std::time::Instant::now(),
+        }
+    }
+    /// `CacheBuilder.expireAfterAccess` with `maximumSize`.
+    fn sweep(&mut self) {
+        if self.last_sweep.elapsed() < std::time::Duration::from_secs(30) {
+            return;
+        }
+        self.last_sweep = std::time::Instant::now();
+        self.entries
+            .retain(|_, e| e.touched.elapsed() < PROFILE_TTL);
+        while self.entries.len() > MAX_PROFILES
+            && let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, e)| e.touched)
+                .map(|(k, _)| k.clone())
+        {
+            self.entries.remove(&oldest);
+        }
+    }
+    /// How the resolution of `key` stands, starting it the first time.
+    pub fn state(&mut self, key: &NameOrId) -> Resolve {
+        while let Ok((key, resolved)) = self.done.try_recv() {
+            self.entries.insert(
+                key,
+                Entry {
+                    touched: std::time::Instant::now(),
+                    resolved: Some(resolved),
+                },
+            );
+        }
+        self.sweep();
+        if let Some(entry) = self.entries.get_mut(key) {
+            entry.touched = std::time::Instant::now();
+            return match &entry.resolved {
+                Some(resolved) => Resolve::Done(resolved.clone()),
+                None => Resolve::Pending,
+            };
+        }
+        // `fetchByName` refuses an invalid name without a fetch; like every
+        // other empty answer that is the cached result.
+        let resolved = matches!(key, NameOrId::Name(name) if !valid_player_name(name));
+        self.entries.insert(
+            key.clone(),
+            Entry {
+                touched: std::time::Instant::now(),
+                resolved: resolved.then_some(None),
+            },
+        );
+        if resolved {
+            return Resolve::Done(None);
+        }
+        let (key, send) = (key.clone(), self.send.clone());
+        std::thread::spawn(move || {
+            let resolved = crate::auth::discovery()
+                .ok()
+                .and_then(|doc| resolve_profile(&key, &doc));
+            let _ = send.send((key, resolved));
+        });
+        Resolve::Pending
+    }
+}
+
+/// `ResolvableProfile` (an item's `minecraft:profile` component, a skull's
+/// `profile` tag): the `textures` property it carries, the key a `Dynamic`
+/// profile resolves by, and `partialProfile.id` — the fallback skin's key.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ProfileInfo {
+    /// `GameProfile.id` (`DefaultPlayerSkin.get`).
+    pub id: u128,
+    /// The `textures` property's value and signature state, when present.
+    pub textures: Option<(String, Signature)>,
+    /// `Dynamic` profiles resolve by name or id.
+    pub dynamic: Option<NameOrId>,
+}
+
+/// A profile's `id`: `UUIDUtil.CODEC` (an int array of four, or a UUID
+/// string).
+fn profile_id(v: &serde_json::Value) -> Option<u128> {
+    match v {
+        serde_json::Value::Array(a) => {
+            let ints: Option<Vec<i64>> = a.iter().map(|x| x.as_i64()).collect();
+            let i = ints?;
+            (i.len() == 4).then(|| {
+                ((i[0] as u32 as u128) << 96)
+                    | ((i[1] as u32 as u128) << 64)
+                    | ((i[2] as u32 as u128) << 32)
+                    | i[3] as u32 as u128
+            })
+        }
+        serde_json::Value::String(s) => crate::auth::parse_uuid(s),
+        _ => None,
+    }
+}
+
+/// `ResolvableProfile`'s read of a `profile` value: a bare name is
+/// `createUnresolved` (the `PLAYER_NAME` codec's alternative), a compound
+/// `name` + `id` + `properties` (`Partial.MAP_CODEC` or a `GameProfile`).
+pub fn parse_profile(v: &serde_json::Value) -> ProfileInfo {
+    if let serde_json::Value::String(name) = v {
+        return ProfileInfo {
+            id: horizon_protocol::crypto::offline_uuid(name),
+            textures: None,
+            dynamic: valid_player_name(name).then(|| NameOrId::Name(name.clone())),
+        };
+    }
+    let name = v.get("name").and_then(|n| n.as_str()).map(str::to_owned);
+    let id = v.get("id").and_then(profile_id);
+    let properties = v.get("properties").and_then(|p| p.as_array());
+    let textures = properties
+        .into_iter()
+        .flatten()
+        .find(|p| p.get("name").and_then(|n| n.as_str()) == Some("textures"))
+        .and_then(|p| {
+            Some((
+                p.get("value")?.as_str()?.to_owned(),
+                if p.get("signature").is_some() {
+                    Signature::Signed
+                } else {
+                    Signature::Unsigned
+                },
+            ))
+        });
+    // `ResolvableProfile.create`: a Partial is Dynamic with no properties
+    // and exactly one of a name or an id.
+    let dynamic =
+        (properties.is_none_or(|p| p.is_empty()) && name.is_some() != id.is_some()).then(|| {
+            name.as_deref().map_or_else(
+                || NameOrId::Id(id.unwrap()),
+                |n| NameOrId::Name(n.to_owned()),
+            )
+        });
+    ProfileInfo {
+        // `createPartialProfile`: the id, else the name's offline UUID, else nil.
+        id: id
+            .or_else(|| name.as_deref().map(horizon_protocol::crypto::offline_uuid))
+            .unwrap_or(0),
+        textures,
+        dynamic,
+    }
+}
+
+/// `ResolvableProfile.create`'s `Dynamic` key from a skull's `profile` tag:
+/// a bare name string is `createUnresolved`, and a compound without
+/// properties and with exactly one of a name or an id is `Dynamic`.
+pub fn dynamic_nbt(profile: &horizon_world::nbt::Tag) -> Option<NameOrId> {
+    if let horizon_world::nbt::Tag::String(s) = profile {
+        let name = s.to_string_lossy();
+        return valid_player_name(&name).then_some(NameOrId::Name(name));
+    }
+    if matches!(profile.get("properties"), Some(horizon_world::nbt::Tag::List(l)) if !l.is_empty())
+    {
+        return None;
+    }
+    match (nbt_text(profile.get("name")), profile_uuid_nbt(profile)) {
+        (Some(name), None) => Some(NameOrId::Name(name)),
+        (None, Some(id)) => Some(NameOrId::Id(id)),
+        _ => None,
+    }
+}
+
+/// `PlayerSkinRenderCache.getOrDefault` for a head: the resolved skin once
+/// its texture is in the atlas (`atlas`), else `partialProfile`'s default.
+pub fn head_skin(
+    profile: &serde_json::Value,
+    resolver: &mut Resolver,
+    downloads: &mut Downloader,
+    atlas: impl Fn(&str) -> bool,
+) -> String {
+    let p = parse_profile(profile);
+    let property = p.textures.or_else(|| {
+        let key = p.dynamic.as_ref()?;
+        match resolver.state(key) {
+            Resolve::Done(Some(profile)) => profile.textures(),
+            _ => None,
+        }
+    });
+    if let Some((value, signature)) = property
+        && let Some(url) = unpack(&value, signature, &TEXTURE_URIS).skin
+        && let Some(hash) = texture_hash(&url)
+    {
+        let location = skin_location(&hash);
+        match downloads.state(Kind::Skin, &url) {
+            Download::Ready if atlas(&location) => return location,
+            // Its slot was evicted: offer the image again.
+            Download::Ready => {
+                downloads.again(&location);
+            }
+            _ => {}
+        }
+    }
+    crate::tab_list::default_skin(p.id).to_owned()
 }
 
 /// `MinecraftProfileTexture.getHash`: the base name of the URL's path.
@@ -352,7 +657,16 @@ pub struct Downloader {
     done: std::sync::mpsc::Receiver<((Kind, String), Option<Vec<u8>>)>,
     send: std::sync::mpsc::Sender<((Kind, String), Option<Vec<u8>>)>,
     ready: Vec<(String, Vec<u8>)>,
+    /// Locations already in `ready`, so `again` does not double-queue.
+    queued: std::collections::HashSet<String>,
+    /// Decoded skin and cape images by location, kept so a skin evicted from the
+    /// atlas uploads again (`again`); the disk cache backs anything dropped.
+    images: std::collections::HashMap<String, Vec<u8>>,
+    image_order: std::collections::VecDeque<String>,
 }
+/// `images` is bounded only so a long session on a busy server does not grow
+/// without end; the disk cache holds everything it drops.
+const MAX_SKIN_IMAGES: usize = 1024;
 impl Downloader {
     pub fn new(root: std::path::PathBuf) -> Self {
         let (send, done) = std::sync::mpsc::channel();
@@ -362,6 +676,9 @@ impl Downloader {
             done,
             send,
             ready: Vec::new(),
+            queued: Default::default(),
+            images: Default::default(),
+            image_order: Default::default(),
         }
     }
     /// How the download of `url` stands, starting it the first time.
@@ -370,8 +687,8 @@ impl Downloader {
             let state = match image {
                 Some(rgba) => {
                     match key.0 {
-                        Kind::Skin => self.ready.push((skin_location(&key.1), rgba)),
-                        Kind::Cape => self.ready.push((cape_location(&key.1), rgba)),
+                        Kind::Skin => self.queue(skin_location(&key.1), rgba),
+                        Kind::Cape => self.queue(cape_location(&key.1), rgba),
                         Kind::Elytra => {}
                     }
                     Download::Ready
@@ -395,27 +712,90 @@ impl Downloader {
             .join(&digest);
         let (url, send) = (url.to_owned(), self.send.clone());
         std::thread::spawn(move || {
-            let bytes = std::fs::read(&file).ok().or_else(|| {
-                let body = http_get(&url)?;
-                let _ = std::fs::create_dir_all(file.parent()?);
-                let _ = std::fs::write(&file, &body);
-                Some(body)
-            });
-            let image = bytes
-                .and_then(|b| crate::hud::decode_bytes(&b).ok())
-                .and_then(|(w, h, rgba)| match kind {
-                    Kind::Skin => process_legacy_skin(w, h, &rgba),
-                    Kind::Cape => cape_in_slot(w, h, &rgba),
-                    Kind::Elytra => Some(rgba),
-                });
+            let image = cached_texture(&file, kind, || http_get(&url));
             let _ = send.send((key, image));
         });
         Download::Pending
     }
+    /// Keeps a decoded texture for `again`, dropping the oldest past the bound.
+    fn remember(&mut self, location: String, rgba: Vec<u8>) {
+        if !self.images.contains_key(&location) {
+            self.image_order.push_back(location.clone());
+            while self.image_order.len() > MAX_SKIN_IMAGES
+                && let Some(old) = self.image_order.pop_front()
+            {
+                self.images.remove(&old);
+            }
+        }
+        self.images.insert(location, rgba);
+    }
+    /// An image off to the atlas: remembered for `again` and marked queued
+    /// so nothing uploads the same location twice.
+    fn queue(&mut self, location: String, rgba: Vec<u8>) {
+        self.remember(location.clone(), rgba.clone());
+        self.queued.insert(location.clone());
+        self.ready.push((location, rgba));
+    }
+    /// A ready skin or cape whose atlas slot was evicted (`show_skin` answered no):
+    /// its image for upload again, from memory or the disk cache.
+    pub fn again(&mut self, location: &str) -> bool {
+        if self.queued.contains(location) {
+            return true;
+        }
+        let (kind, digest) = if let Some(digest) = location.strip_prefix("skins/") {
+            (Kind::Skin, digest)
+        } else if let Some(digest) = location.strip_prefix("capes/") {
+            (Kind::Cape, digest)
+        } else {
+            return false;
+        };
+        let image = self.images.get(location).cloned().or_else(|| {
+            let file = self
+                .root
+                .join(if digest.len() > 2 { &digest[..2] } else { "xx" })
+                .join(digest);
+            cached_texture(&file, kind, || None)
+        });
+        let Some(image) = image else {
+            return false;
+        };
+        self.queue(location.to_owned(), image);
+        true
+    }
     /// Skins and capes that finished since the last call: texture id and 64x64 RGBA.
     pub fn take_ready(&mut self) -> Vec<(String, Vec<u8>)> {
+        for (location, _) in &self.ready {
+            self.queued.remove(location);
+        }
         std::mem::take(&mut self.ready)
     }
+}
+
+/// Decode before trusting or persisting a cached response: truncated PNGs and HTTP error bodies
+/// must not become a permanent default-skin result on subsequent launches.
+fn cached_texture(
+    file: &std::path::Path,
+    kind: Kind,
+    fetch: impl FnOnce() -> Option<Vec<u8>>,
+) -> Option<Vec<u8>> {
+    let decode = |bytes: &[u8]| {
+        let (w, h, rgba) = crate::hud::decode_bytes(bytes).ok()?;
+        match kind {
+            Kind::Skin => process_legacy_skin(w, h, &rgba),
+            Kind::Cape => cape_in_slot(w, h, &rgba),
+            Kind::Elytra => Some(rgba),
+        }
+    };
+    if let Some(image) = std::fs::read(file).ok().and_then(|bytes| decode(&bytes)) {
+        return Some(image);
+    }
+    let bytes = fetch()?;
+    let image = decode(&bytes)?;
+    if let Some(parent) = file.parent() {
+        let _ = std::fs::create_dir_all(parent);
+        let _ = std::fs::write(file, &bytes);
+    }
+    Some(image)
 }
 
 /// A GET over HTTP or HTTPS (textures.minecraft.net serves both; vanilla
@@ -619,6 +999,248 @@ pub fn sha1(data: &[u8]) -> [u8; 20] {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn profiles_parse_like_resolvable_profiles() {
+        use super::{NameOrId, Signature, parse_profile};
+        // A bare name is `createUnresolved`: dynamic by name, and its partial
+        // id is the name's offline UUID.
+        let p = parse_profile(&serde_json::json!("Notch"));
+        assert_eq!(p.dynamic, Some(NameOrId::Name("Notch".into())));
+        assert_eq!(p.id, horizon_protocol::crypto::offline_uuid("Notch"));
+        assert!(p.textures.is_none());
+        // A name-only compound resolves the same way.
+        let p = parse_profile(&serde_json::json!({"name": "Notch"}));
+        assert_eq!(p.dynamic, Some(NameOrId::Name("Notch".into())));
+        // An id-only compound resolves by id (int array or UUID string).
+        let id = 0x0123_4567_89ab_cdef_0123_4567_89ab_cdef_u128;
+        let ints: Vec<i64> = [
+            (id >> 96) as i32 as i64,
+            (id >> 64) as i32 as i64,
+            (id >> 32) as i32 as i64,
+            id as i32 as i64,
+        ]
+        .into();
+        let p = parse_profile(&serde_json::json!({"id": ints}));
+        assert_eq!(p.dynamic, Some(NameOrId::Id(id)));
+        let p = parse_profile(&serde_json::json!({"id": "01234567-89ab-cdef-0123-4567abcdef00"}));
+        assert_eq!(
+            p.dynamic,
+            Some(NameOrId::Id(0x0123_4567_89ab_cdef_0123_4567_abcd_ef00))
+        );
+        // Name and id but no properties is Static: it never resolves, and its
+        // default skin keys off the id.
+        let p = parse_profile(&serde_json::json!({"name": "Notch", "id": ints}));
+        assert!(p.dynamic.is_none());
+        assert_eq!(p.id, id);
+        // A `textures` property makes it Static (unsigned and signed).
+        let p = parse_profile(&serde_json::json!({
+            "properties": [{"name": "textures", "value": "v"}]
+        }));
+        assert!(p.dynamic.is_none());
+        assert_eq!(p.textures, Some(("v".into(), Signature::Unsigned)));
+        let p = parse_profile(&serde_json::json!({
+            "properties": [{"name": "textures", "value": "v", "signature": "s"}]
+        }));
+        assert_eq!(p.textures, Some(("v".into(), Signature::Signed)));
+        // Empty properties leave it dynamic.
+        let p = parse_profile(&serde_json::json!({"name": "Notch", "properties": []}));
+        assert_eq!(p.dynamic, Some(NameOrId::Name("Notch".into())));
+    }
+
+    /// `getByName` and `getProfileById` answer from the services the
+    /// discovery document names; a profile resolves through both.
+    #[test]
+    fn profiles_resolve_through_the_services() {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let reply = |status: &str, body: &str| {
+                format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+            };
+            for stream in listener.incoming().take(3) {
+                let mut stream = stream.unwrap();
+                let mut line = String::new();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                reader.read_line(&mut line).unwrap();
+                while reader.read_line(&mut String::new()).unwrap() > 2 {}
+                let body = if line.contains("/users/profiles/minecraft/") {
+                    r#"{"id":"069a79f444e94726a5befca90e38aaf5","name":"Notch"}"#
+                } else if line.contains("/session/minecraft/profile/")
+                    && line.contains("unsigned=false")
+                {
+                    r#"{"id":"069a79f444e94726a5befca90e38aaf5","name":"Notch","properties":[{"name":"textures","value":"dmFsdWU=","signature":"c2ln"}]}"#
+                } else {
+                    "{}"
+                };
+                stream.write_all(reply("200 OK", body).as_bytes()).unwrap();
+            }
+        });
+        let doc = serde_json::json!({"discovery": {
+            "profiles": {"endpoints": {"getByName": {"uri": format!("{base}/users/profiles/minecraft/{{name}}")}}},
+            "session": {"endpoints": {"getProfileById": {"uri": format!("{base}/session/minecraft/profile/{{profileId}}")}}},
+        }});
+        let resolved =
+            super::resolve_profile(&super::NameOrId::Name("Notch".into()), &doc).unwrap();
+        assert_eq!(resolved.id, 0x069a_79f4_44e9_4726_a5be_fca9_0e38_aaf5);
+        assert_eq!(resolved.name, "Notch");
+        assert_eq!(
+            resolved.properties,
+            vec![(
+                "textures".to_owned(),
+                "dmFsdWU=".to_owned(),
+                Some("c2ln".to_owned())
+            )]
+        );
+        let by_id = super::resolve_profile(&super::NameOrId::Id(resolved.id), &doc).unwrap();
+        assert_eq!(by_id.name, "Notch");
+        // A discovery without `profiles`/`getByName` resolves no name.
+        let doc = serde_json::json!({"discovery": {
+            "session": {"endpoints": {"getProfileById": {"uri": format!("{base}/session/minecraft/profile/{{profileId}}")}}},
+        }});
+        assert!(super::resolve_profile(&super::NameOrId::Name("Notch".into()), &doc).is_none());
+    }
+
+    #[test]
+    fn corrupt_skin_cache_is_refetched_and_invalid_downloads_are_not_saved() {
+        let root = std::env::temp_dir().join(format!(
+            "skin-cache-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("skin");
+        std::fs::write(&file, b"broken PNG").unwrap();
+        let mut png_bytes = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut png_bytes, 64, 64);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder
+                .write_header()
+                .unwrap()
+                .write_image_data(&vec![255; 64 * 64 * 4])
+                .unwrap();
+        }
+        assert!(
+            super::cached_texture(&file, super::Kind::Skin, || Some(png_bytes.clone())).is_some()
+        );
+        assert_eq!(std::fs::read(&file).unwrap(), png_bytes);
+        assert!(
+            super::cached_texture(&file, super::Kind::Skin, || panic!(
+                "valid cache must not fetch"
+            ))
+            .is_some()
+        );
+        let missing = root.join("missing");
+        assert!(
+            super::cached_texture(&missing, super::Kind::Skin, || Some(b"HTTP error".to_vec()))
+                .is_none()
+        );
+        assert!(!missing.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A skin evicted from the atlas re-uploads (`again`), once per ask.
+    #[test]
+    fn evicted_skins_upload_again() {
+        let mut d = super::Downloader::new(std::env::temp_dir().join("horizon-test-skins"));
+        d.remember("skins/abc".into(), vec![1, 2, 3]);
+        assert!(d.again("skins/abc"));
+        assert!(!d.again("skins/missing"));
+        // Once queued, more asks do not pile up uploads.
+        assert!(d.again("skins/abc"));
+        assert_eq!(
+            d.take_ready(),
+            vec![("skins/abc".to_owned(), vec![1, 2, 3])]
+        );
+        assert!(d.take_ready().is_empty());
+        assert!(d.again("skins/abc"));
+        assert_eq!(d.take_ready().len(), 1);
+        // The first upload marks the location queued too: an `again` before
+        // `take_ready` does not put the same skin in the atlas twice.
+        d.queue("skins/def".into(), vec![4]);
+        assert!(d.again("skins/def"));
+        assert_eq!(d.take_ready(), vec![("skins/def".to_owned(), vec![4])]);
+    }
+
+    /// Capes share the atlas with skins and must survive both atlas and decoded-image eviction.
+    #[test]
+    fn evicted_capes_upload_again_from_memory_and_disk() {
+        let root = std::env::temp_dir().join(format!(
+            "cape-cache-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut d = super::Downloader::new(root.clone());
+        let location = super::cape_location("test-cape");
+        let digest = location.strip_prefix("capes/").unwrap();
+        let file = root.join(&digest[..2]).join(digest);
+        let rgba = vec![7; 64 * 32 * 4];
+        let mut png_bytes = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut png_bytes, 64, 32);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder
+                .write_header()
+                .unwrap()
+                .write_image_data(&rgba)
+                .unwrap();
+        }
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, b"broken PNG").unwrap();
+        let image = super::cached_texture(&file, super::Kind::Cape, || Some(png_bytes))
+            .expect("corrupt cached cape should refetch");
+        assert_eq!(image.len(), 64 * 64 * 4);
+        assert_eq!(&image[..rgba.len()], &rgba);
+        assert!(image[rgba.len()..].iter().all(|&b| b == 0));
+        d.send
+            .send(((super::Kind::Cape, "test-cape".into()), Some(image.clone())))
+            .unwrap();
+        assert_eq!(
+            d.state(
+                super::Kind::Cape,
+                "https://textures.minecraft.net/texture/test-cape"
+            ),
+            super::Download::Ready
+        );
+        assert!(d.again(&location));
+        assert_eq!(d.take_ready(), vec![(location.clone(), image.clone())]);
+        assert!(d.again(&location));
+        assert!(d.again(&location));
+        assert_eq!(d.take_ready(), vec![(location.clone(), image.clone())]);
+        d.images.clear();
+        d.image_order.clear();
+        assert!(d.again(&location));
+        assert_eq!(d.take_ready(), vec![(location, image)]);
+        // A valid skin PNG still fails cape dimensions and must not be saved as a cape.
+        let invalid = root.join("invalid");
+        let mut square = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut square, 64, 64);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder
+                .write_header()
+                .unwrap()
+                .write_image_data(&vec![255; 64 * 64 * 4])
+                .unwrap();
+        }
+        assert!(super::cached_texture(&invalid, super::Kind::Cape, || Some(square)).is_none());
+        assert!(!invalid.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn profile_components_supply_unsigned_head_skins() {
         let value = "eyJ0ZXh0dXJlcyI6IHsiU0tJTiI6IHsidXJsIjogImh0dHBzOi8vdGV4dHVyZXMubWluZWNyYWZ0Lm5ldC90ZXh0dXJlL2FiYzEyMyJ9fX0=";

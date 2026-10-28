@@ -995,6 +995,11 @@ impl Scoreboard {
     /// `addPlayerToTeam`: leaves the old team first (even when it is the
     /// same one); false when the team already listed the player.
     pub fn add_to_team(&mut self, player: &str, team: &str) -> bool {
+        // Java takes an existing PlayerTeam object. Our name-based API must
+        // enforce that precondition before removing the current membership.
+        if self.team(team).is_none() {
+            return false;
+        }
         self.remove_from_team(player);
         self.team_of.insert(player.to_owned(), team.to_owned());
         match self.team_mut(team) {
@@ -1483,6 +1488,14 @@ mod tests {
         sb.add_team("red");
         sb.add_team("blue");
         assert!(sb.add_to_team("Steve", "red"));
+        assert!(!sb.add_to_team("Steve", "unknown"));
+        assert_eq!(
+            sb.players_team("Steve").map(|t| t.name.as_str()),
+            Some("red")
+        );
+        assert!(!sb.add_to_team("Nobody", "unknown"));
+        sb.add_team("unknown");
+        assert!(sb.players_team("Nobody").is_none());
         // Joining the same team leaves it first, so it succeeds again.
         assert!(sb.add_to_team("Steve", "red"));
         assert!(sb.add_to_team("Alex", "red"));

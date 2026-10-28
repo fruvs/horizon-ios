@@ -36,9 +36,15 @@ pub struct Vertex {
     pub color: u32,
     /// Smooth light, 16x fixed point: sky in bits 0..8, block in bits 8..16.
     pub light: u32,
-    /// RGBA8_SNORM face normal; w = -127 for two-sided lighting, 0 to keep baked/unlit colour.
+    /// RGBA8_SNORM face normal; w = -127 for two-sided lighting, 0 to keep baked/unlit colour,
+    /// [`CULL_BACK`] to keep it and also drop back-facing pixels.
     pub normal: [i8; 4],
+    /// The `GLINT_TEXTURING` atlas UV for a foil item quad; zero elsewhere.
+    pub glint_uv: [f32; 2],
 }
+/// `Vertex::normal` of a baked-colour quad of an `entitySolid` model: the render type culls
+/// back faces, which the entity pipelines here do not, so `entity.wgsl` discards them.
+pub const CULL_BACK: [i8; 4] = [0, 0, 0, 1];
 /// A section vertex: vanilla's `DefaultVertexFormat.BLOCK` (position, colour,
 /// UV0, UV2) with the sprite's array layer beside the light, in 24 bytes
 /// rather than vanilla's 28: the UV is fixed point, which holds model UVs
@@ -55,7 +61,7 @@ pub struct TerrainVertex {
     /// UV within the sprite, `UV_STEPS` per unit (`TerrainVertex::new`,
     /// `terrain.wgsl`'s `terrain_uv`).
     pub(crate) uv: [u16; 2],
-    /// Sprite array layer, with `OPAQUE_LAYER` for opaque leaves.
+    /// Sprite array layer, with `OPAQUE_LAYER` for opaque leaves and quads over opaque texels.
     pub layer: u16,
     /// Smooth light, 16x fixed point: sky in the low byte, block in the high one.
     pub light: u16,
@@ -122,13 +128,101 @@ mod vertex_tests {
         assert_eq!(super::emitting(rgb, 15) | super::EMISSION_BITS, rgb);
     }
 }
+/// The block a terrain quad came from, kept beside the vertices (the vertex
+/// layout has no room for it): shader packs map blocks to their own IDs and
+/// a sprite layer is shared by many blocks, so it cannot be recovered from
+/// the texture.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct QuadState {
+    /// The `BlockStateId` of the block whose model or fluid emitted the quad.
+    /// A waterlogged block's fluid quads carry the block's own state, not water's.
+    pub state: u32,
+    /// The quad is part of the block's fluid (`fluid::tesselate`), not its model.
+    pub fluid: bool,
+    /// The section-local cell `[x, y, z]` (each 0 to 15) of the block that
+    /// emitted the quad, as the mesh loop visited it. Not derived from the
+    /// vertices: offset, rotated or protruding models leave their cell.
+    /// Meaningless (zero) when `state` is `UNKNOWN`'s.
+    pub block: [u8; 3],
+    /// The CPU colour inputs the vertex colour was baked from. `None` unless
+    /// the model or fluid emitter that made the quad filled it in, so unknown
+    /// or hand-built metadata cannot pretend to have lighting.
+    pub lighting: Option<QuadLighting>,
+}
+/// What `TerrainVertex::color` (directional shade and AO already multiplied
+/// into RGB, emission in the alpha's free bits) was baked from, kept exactly
+/// as the mesher computed it so a shader pack that lights the terrain itself
+/// need not undo the bake. Packed like the vertex colour (`pack_rgb`: red in
+/// the low byte); the vertex colour itself is not changed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QuadLighting {
+    /// The biome or model tint alone (white when untinted), alpha 255.
+    pub tint: u32,
+    /// `tint` with the face's directional shade, without AO, alpha 255.
+    pub shaded_tint: u32,
+    /// Per vertex, `tint` times AO without the directional shade in RGB; the
+    /// alpha byte is the AO gray level itself (255 for flat-lit faces and
+    /// fluids), not the vertex colour's emission bits.
+    pub no_directional: [u32; 4],
+}
+impl QuadState {
+    /// For quads whose block is not known (distant-terrain meshes merge faces
+    /// of many blocks): never a valid state id. `Default` is air's id, so it
+    /// must not stand in for this.
+    pub const UNKNOWN: Self = Self {
+        state: u32::MAX,
+        fluid: false,
+        block: [0; 3],
+        lighting: None,
+    };
+    /// The state of a quad emitted by the block in section-local `cell`, with
+    /// no lighting data (the emitters add it).
+    pub fn new(state: u32, cell: [i32; 3], fluid: bool) -> Self {
+        debug_assert!(cell.iter().all(|c| (0..16).contains(c)), "{cell:?}");
+        Self {
+            state,
+            fluid,
+            block: cell.map(|c| (c & 15) as u8),
+            lighting: None,
+        }
+    }
+}
+/// `gray` (0 to 255) of a colour channel-wise multiplied into `tint`
+/// (`0xRRGGBB`, `None` for white): the integer maths of a vertex colour.
+fn tinted(gray: u32, tint: Option<u32>) -> [u32; 3] {
+    match tint {
+        Some(t) => [16, 8, 0].map(|shift| gray * (t >> shift & 255) / 255),
+        None => [gray; 3],
+    }
+}
+/// The `QuadLighting` of a model face: its tint, the directional shade
+/// (`ARGB.gray` of the cardinal light) and each vertex's AO gray level
+/// (`lighting::gray` of its brightness; 255 without smooth lighting).
+fn model_lighting(tint: Option<u32>, directional: f32, ao_gray: [i32; 4]) -> QuadLighting {
+    let shade = lighting::gray(directional).clamp(0, 255) as u32;
+    QuadLighting {
+        tint: pack_rgb(tinted(255, tint)),
+        shaded_tint: pack_rgb(tinted(shade, tint)),
+        no_directional: ao_gray.map(|g| {
+            let g = g.clamp(0, 255) as u32;
+            pack_rgb(tinted(g, tint)) & 0x00FF_FFFF | g << 24
+        }),
+    }
+}
 pub struct SectionMesh {
     pub solid: Vec<TerrainVertex>,
+    /// The block of each quad of `solid` (four vertices each), in the same
+    /// order, also after `sort_solid`. Empty (never partly filled) when the
+    /// mesh did not come from `Mesher::mesh` (distant terrain): read it with
+    /// `solid_state`, which answers `QuadState::UNKNOWN` then.
+    pub solid_states: Vec<QuadState>,
     /// The buckets `solid` is sorted in by the side its quads face: empty
     /// until `sort_solid`, which the meshing workers call; `solid` is in
     /// model order before.
     pub sides: Sides,
     pub translucent: Vec<TerrainVertex>,
+    /// `solid_states` for `translucent`.
+    pub translucent_states: Vec<QuadState>,
     /// VisGraph: bit `a * 6 + b` is set when faces `a` and `b` (Direction
     /// order) are connected through non-opaque blocks.
     pub visibility: u64,
@@ -141,8 +235,10 @@ impl Default for SectionMesh {
     fn default() -> Self {
         Self {
             solid: Vec::new(),
+            solid_states: Vec::new(),
             sides: Sides::default(),
             translucent: Vec::new(),
+            translucent_states: Vec::new(),
             visibility: ALL_VISIBLE,
             block_entities: Vec::new(),
         }
@@ -150,9 +246,38 @@ impl Default for SectionMesh {
 }
 impl SectionMesh {
     /// Sorts the solid quads by the side they face, for the renderer to
-    /// leave out those facing away from the eye (`sides`).
+    /// leave out those facing away from the eye (`sides`). Their states move
+    /// with them.
     pub fn sort_solid(&mut self) {
-        self.sides = sides::sort(&mut self.solid);
+        debug_assert!(self.states_match(), "quad states out of step with vertices");
+        if !self.solid_states.is_empty() && self.solid_states.len() * 4 != self.solid.len() {
+            // Out of step (a bug, caught above in debug builds): unknown
+            // beats the wrong block.
+            self.solid_states.clear();
+        }
+        self.sides = sides::sort_with_states(&mut self.solid, &mut self.solid_states);
+    }
+    /// The block of solid quad `quad` (`QuadState::UNKNOWN` without states).
+    pub fn solid_state(&self, quad: usize) -> QuadState {
+        self.solid_states
+            .get(quad)
+            .copied()
+            .unwrap_or(QuadState::UNKNOWN)
+    }
+    /// The block of translucent quad `quad` (`QuadState::UNKNOWN` without states).
+    pub fn translucent_state(&self, quad: usize) -> QuadState {
+        self.translucent_states
+            .get(quad)
+            .copied()
+            .unwrap_or(QuadState::UNKNOWN)
+    }
+    /// Each state list is empty (no block data) or has one entry per quad.
+    pub fn states_match(&self) -> bool {
+        let ok = |vertices: &[TerrainVertex], states: &[QuadState]| {
+            vertices.len().is_multiple_of(4)
+                && (states.is_empty() || states.len() * 4 == vertices.len())
+        };
+        ok(&self.solid, &self.solid_states) && ok(&self.translucent, &self.translucent_states)
     }
 }
 pub const ALL_VISIBLE: u64 = (1 << 36) - 1;
@@ -248,6 +373,8 @@ fn visibility(pad: &Padded, info: &[Info]) -> u64 {
 }
 #[cfg(test)]
 mod particle_tests;
+#[cfg(test)]
+mod state_tests;
 #[cfg(test)]
 mod visibility_tests;
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -759,7 +886,7 @@ impl Mesher<'_> {
                     if state.fluid.kind() != FluidKind::Empty {
                         let water = tints.get(Resolver::Water, x, y, z);
                         let nether = self.nether_shading;
-                        fluid::tesselate(self.tables, nether, &pad, water, &mut out, [x, y, z]);
+                        fluid::tesselate(self.tables, nether, &pad, water, &mut out, [x, y, z], id);
                     }
                     if !state.model {
                         continue;
@@ -817,12 +944,16 @@ impl Mesher<'_> {
                                 face,
                                 ao,
                                 state,
+                                id,
                             );
                         }
                     }
                 }
             }
         }
+        debug_assert!(out.states_match(), "a quad was emitted without its state");
+        debug_assert_eq!(out.solid_states.len() * 4, out.solid.len());
+        debug_assert_eq!(out.translucent_states.len() * 4, out.translucent.len());
         out
     }
     /// `BlockColors` tint source `index`, or `None` for an untinted (-1) layer.
@@ -856,42 +987,46 @@ impl Mesher<'_> {
         face: &BakedFace,
         ao: bool,
         state: &Info,
+        id: u32,
     ) {
         let q = &face.quad;
         let shade_face = q.shade_direction_override.unwrap_or(q.facing);
         let directional = lighting::cardinal(self.nether_shading, shade_face);
         // Grey level per vertex before tinting, and vanilla light coords.
-        let (gray, coords) = if ao {
+        let (gray, ao_gray, coords) = if ao {
             let info = &self.tables.info;
             let (brightness, coords) =
                 lighting::ambient_occlusion(pad, info, state, pos, &q.positions, q.facing);
             let gray = brightness.map(|b| lighting::scale(lighting::gray(b), directional));
-            (gray, coords)
+            (gray, brightness.map(lighting::gray), coords)
         } else {
             let coords = match q.cull {
                 Some(d) => lighting::coords(pad, state, lighting::step(pos, d)),
                 None => lighting::flat(pad, state, pos, &q.positions, q.facing),
             };
-            ([lighting::gray(directional); 4], [coords; 4])
+            ([lighting::gray(directional); 4], [255; 4], [coords; 4])
         };
         let tint = Self::tint(state, q.tint_index, tints, pos);
-        let target = if face.translucent {
-            &mut out.translucent
+        let (target, states) = if face.translucent {
+            (&mut out.translucent, &mut out.translucent_states)
         } else {
-            &mut out.solid
+            (&mut out.solid, &mut out.solid_states)
         };
+        // `pos` is the block's cell; `origin` may be offset away from it.
+        states.push(QuadState {
+            lighting: Some(model_lighting(tint, directional, ao_gray)),
+            ..QuadState::new(id, pos, false)
+        });
         for i in 0..4 {
             let g = gray[i] as u32;
-            let rgb = match tint {
-                Some(t) => [16, 8, 0].map(|shift| g * (t >> shift & 255) / 255),
-                None => [g; 3],
-            };
+            let rgb = tinted(g, tint);
             let p = q.positions[i];
             target.push(TerrainVertex::new(
                 [p[0] + origin[0], p[1] + origin[1], p[2] + origin[2]],
                 q.uv[i],
-                // Opaque leaves (forceOpaque) draw in the solid layer: no alpha cutout.
-                if !self.cutout_leaves && state.leaves {
+                // Opaque leaves (forceOpaque) and quads over opaque texels draw in the
+                // solid layer: no alpha cutout (a dirt path's side skips its clear top row).
+                if face.opaque && !face.translucent || !self.cutout_leaves && state.leaves {
                     face.layer as u16 | OPAQUE_LAYER
                 } else {
                     face.layer as u16

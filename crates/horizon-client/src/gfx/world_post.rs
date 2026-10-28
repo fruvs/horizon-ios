@@ -25,7 +25,7 @@ pub struct Post {
 impl Post {
     pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
         let shader = crate::gfx::shader_module(
-            &device,
+            device,
             wgpu::ShaderModuleDescriptor {
                 label: Some("Horizon post"),
                 source: wgpu::ShaderSource::Wgsl(include_str!("../world_post.wgsl").into()),
@@ -59,7 +59,7 @@ impl Post {
         });
         let pipeline = |entry: &str| {
             crate::gfx::render_pipeline(
-                &device,
+                device,
                 &wgpu::RenderPipelineDescriptor {
                     label: Some("Horizon post"),
                     layout: Some(&pipeline_layout),
