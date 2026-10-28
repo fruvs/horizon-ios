@@ -1417,6 +1417,8 @@ struct Game<'a> {
     pending_entry: Option<PendingWorldEntry>,
     world_loader: Option<world_loading::WorldLoader>,
     pending_pack_reload: bool,
+    local_pack_reload:
+        Option<std::thread::JoinHandle<std::result::Result<packs::StagedPack, String>>>,
     /// A server's resource packs (game/server_packs.rs).
     server_packs: server_packs::ServerPackState,
     /// The link a chat click asks to open (`ConfirmLinkScreen`).
@@ -12577,6 +12579,7 @@ impl Game<'_> {
             event_loop.exit();
             return;
         }
+        self.poll_local_pack_reload();
         self.tick_server_packs();
         self.poll_control(event_loop);
         if !self.splitscreen.guest {
@@ -13806,6 +13809,7 @@ impl<'a> Game<'a> {
             pending_entry: None,
             world_loader: None,
             pending_pack_reload: false,
+            local_pack_reload: None,
             server_packs: Default::default(),
             link_prompt: None,
             dialogs: Default::default(),

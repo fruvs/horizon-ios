@@ -336,7 +336,10 @@ impl Game<'_> {
     pub(super) fn tick_server_packs(&mut self) {
         self.server_packs.notifiers.retain_mut(PackNotifier::poll);
         // A reload waits for the world's resources (`reload_packs`).
-        if self.rest_loader.is_some() || self.world_loader.is_some() {
+        if self.local_pack_reload.is_some()
+            || self.rest_loader.is_some()
+            || self.world_loader.is_some()
+        {
             return;
         }
         self.drive_pack_reload();

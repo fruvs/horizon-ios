@@ -136,37 +136,79 @@ impl Game<'_> {
             self.pending_pack_reload = true;
             return;
         }
-        if let Err(e) = self.reload_selected_packs() {
-            log::warn!("Horizon: resource reload failed: {e}");
-            if self.screen != super::Screen::Options {
-                self.open_options_at(
-                    self.title.is_some(),
-                    horizon_client::options_ui::Page::Packs,
-                );
-            }
-            self.ui.options.resource_error = Some(e.to_string());
+        if self.local_pack_reload.is_some() || self.server_packs.reload.is_some() {
+            self.pending_pack_reload = true;
+            return;
         }
-    }
-    /// The CPU half of the reload, safe on a worker (`PackReload` runs it):
-    /// `apply_staged_pack` finishes the GPU half and the swap.
-    pub(super) fn stage_selected_packs(&mut self) -> horizon_client::Result<StagedPack> {
         let vanilla = self.vanilla_root();
         if self.ui.vanilla_root.as_os_str().is_empty() {
             self.ui.vanilla_root = vanilla.clone();
         }
-        stage_pack(
-            &vanilla,
-            &self.settings.resource_packs,
-            &self.server_packs.active,
-            &self.settings.mods.enabled,
-            &self.options.dev_mods,
-            &self.pack.assets,
-            &self.res,
-            &self.pack.context,
-            self.settings.force_unicode,
-            self.settings.japanese_glyphs,
-            &super::Progress::new(),
-        )
+        let selected = self.settings.resource_packs.clone();
+        let server = self.server_packs.active.clone();
+        let mods = self.settings.mods.enabled.clone();
+        let dev_mods = self.options.dev_mods.clone();
+        let assets = self.pack.assets.clone();
+        let res = self.res.clone();
+        let context = self.pack.context.clone();
+        let unicode = self.settings.force_unicode;
+        let japanese = self.settings.japanese_glyphs;
+        match std::thread::Builder::new()
+            .name("local-pack-reload".into())
+            .spawn(move || {
+                stage_pack(
+                    &vanilla,
+                    &selected,
+                    &server,
+                    &mods,
+                    &dev_mods,
+                    &assets,
+                    &res,
+                    &context,
+                    unicode,
+                    japanese,
+                    &super::Progress::new(),
+                )
+                .map_err(|error| error.to_string())
+            }) {
+            Ok(worker) => self.local_pack_reload = Some(worker),
+            Err(error) => self.ui.options.resource_error = Some(error.to_string()),
+        }
+    }
+
+    pub(super) fn poll_local_pack_reload(&mut self) {
+        // World preparation captures the current pack context. Let it install
+        // its streaming state before swapping atlases and reloading that state.
+        if self.rest_loader.is_some() || self.world_loader.is_some() {
+            return;
+        }
+        if self
+            .local_pack_reload
+            .as_ref()
+            .is_some_and(|worker| worker.is_finished())
+        {
+            let worker = self.local_pack_reload.take().unwrap();
+            let result = worker
+                .join()
+                .unwrap_or_else(|_| Err("Resource pack worker panicked".into()));
+            // A newer selection supersedes this generation; do not briefly apply obsolete resources.
+            if !self.pending_pack_reload
+                && let Err(error) =
+                    result.and_then(|pack| self.apply_staged_pack(pack).map_err(|e| e.to_string()))
+            {
+                log::warn!("Horizon: resource reload failed: {error}");
+                self.ui.options.resource_error = Some(error);
+            }
+        }
+        if self.pending_pack_reload
+            && self.local_pack_reload.is_none()
+            && self.server_packs.reload.is_none()
+            && self.rest_loader.is_none()
+            && self.world_loader.is_none()
+        {
+            self.pending_pack_reload = false;
+            self.reload_packs();
+        }
     }
     /// The render-thread half: the renderer on the new pack's textures, then
     /// the swap (`ReloadInstance`'s application listeners).
@@ -249,15 +291,9 @@ impl Game<'_> {
         self.creative_screen.forget_items();
         Ok(())
     }
-    /// `Minecraft.reloadResourcePacks`: the reload staged on the spot, then
-    /// applied (`PackReload` runs the same two phases across frames).
-    pub(super) fn reload_selected_packs(&mut self) -> horizon_client::Result<()> {
-        let staged = self.stage_selected_packs()?;
-        self.apply_staged_pack(staged)
-    }
 }
 
-/// The CPU half of `reload_selected_packs` (`PackReload` runs it on a
+/// The CPU half of a resource reload (local and server packs run it on a
 /// worker; `apply_staged_pack` does the GPU half and the swap): the overlay
 /// root, the models and sprites, the menu bundle, the pack's tables and its
 /// CPU mip chains.
