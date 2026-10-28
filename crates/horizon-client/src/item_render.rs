@@ -400,7 +400,9 @@ impl FileSprites {
             }
             None => (iw, ih),
         };
-        if w == 0 || h == 0 {
+        // Match atlas validation before deriving frame coordinates: an oversized
+        // frame otherwise divides by zero or reads beyond the decoded image.
+        if w == 0 || h == 0 || iw % w != 0 || ih % h != 0 {
             return None;
         }
         let columns = iw / w;
@@ -830,6 +832,59 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         assert!(!broken_items.starts_with("item models:"));
         assert!(bad_model.starts_with("item models:"));
+        Ok(())
+    }
+
+    #[test]
+    fn item_sprite_rejects_invalid_animation_dimensions() -> crate::Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "horizon-item-frame-dimensions-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        ));
+        let texture = root.join("assets/test/textures/item.png");
+        fs::create_dir_all(texture.parent().unwrap())?;
+        let mut encoder = png::Encoder::new(fs::File::create(&texture)?, 4, 4);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder
+            .write_header()?
+            .write_image_data(&[255; 4 * 4 * 4])?;
+        let sprites = FileSprites {
+            root: root.clone(),
+            permutations: Vec::new(),
+            cache: Mutex::default(),
+            translucent: Mutex::default(),
+        };
+        let metadata = texture.with_extension("png.mcmeta");
+        for (width, height) in [(8, 4), (4, 8), (3, 4), (4, 3)] {
+            fs::write(
+                &metadata,
+                serde_json::json!({"animation": {"width": width, "height": height}}).to_string(),
+            )?;
+            assert!(sprites.load("test:item").is_none(), "{width}x{height}");
+            let library = ModelLibrary::with_item_generator(std::collections::BTreeMap::from([(
+                "test:item".into(),
+                horizon_assets::model::CuboidModel::from_json(
+                    r#"{"parent":"builtin/generated","textures":{"layer0":"test:item"}}"#,
+                )?,
+            )]))?;
+            let baked = bake_item_model(&library, &sprites, "test:item")?;
+            assert!(!baked.quads.is_empty());
+            assert!(
+                baked
+                    .quads
+                    .iter()
+                    .all(|q| q.material.sprite == "minecraft:missingno")
+            );
+        }
+        fs::write(&metadata, r#"{"animation":{"width":2,"height":2}}"#)?;
+        let mask = sprites.load("test:item").unwrap();
+        assert_eq!((mask.width, mask.height, mask.frames.len()), (2, 2, 4));
+        assert!(mask.frames.iter().all(|frame| frame == &[false; 4]));
+        fs::remove_dir_all(root)?;
         Ok(())
     }
 

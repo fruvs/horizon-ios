@@ -682,18 +682,7 @@ impl Downloader {
             .join(&digest);
         let (url, send) = (url.to_owned(), self.send.clone());
         std::thread::spawn(move || {
-            let bytes = std::fs::read(&file).ok().or_else(|| {
-                let body = http_get(&url)?;
-                let _ = std::fs::create_dir_all(file.parent()?);
-                let _ = std::fs::write(&file, &body);
-                Some(body)
-            });
-            let image = bytes
-                .and_then(|b| crate::hud::decode_bytes(&b).ok())
-                .and_then(|(w, h, rgba)| match kind {
-                    Kind::Skin => process_legacy_skin(w, h, &rgba),
-                    _ => Some(rgba),
-                });
+            let image = cached_texture(&file, kind, || http_get(&url));
             let _ = send.send((key, image));
         });
         Download::Pending
@@ -747,6 +736,32 @@ impl Downloader {
         }
         std::mem::take(&mut self.ready)
     }
+}
+
+/// Decode before trusting or persisting a cached response: truncated PNGs and HTTP error bodies
+/// must not become a permanent default-skin result on subsequent launches.
+fn cached_texture(
+    file: &std::path::Path,
+    kind: Kind,
+    fetch: impl FnOnce() -> Option<Vec<u8>>,
+) -> Option<Vec<u8>> {
+    let decode = |bytes: &[u8]| {
+        let (w, h, rgba) = crate::hud::decode_bytes(bytes).ok()?;
+        match kind {
+            Kind::Skin => process_legacy_skin(w, h, &rgba),
+            _ => Some(rgba),
+        }
+    };
+    if let Some(image) = std::fs::read(file).ok().and_then(|bytes| decode(&bytes)) {
+        return Some(image);
+    }
+    let bytes = fetch()?;
+    let image = decode(&bytes)?;
+    if let Some(parent) = file.parent() {
+        let _ = std::fs::create_dir_all(parent);
+        let _ = std::fs::write(file, &bytes);
+    }
+    Some(image)
 }
 
 /// A GET over HTTP or HTTPS (textures.minecraft.net serves both; vanilla
@@ -1020,6 +1035,49 @@ mod tests {
             "session": {"endpoints": {"getProfileById": {"uri": format!("{base}/session/minecraft/profile/{{profileId}}")}}},
         }});
         assert!(super::resolve_profile(&super::NameOrId::Name("Notch".into()), &doc).is_none());
+    }
+
+    #[test]
+    fn corrupt_skin_cache_is_refetched_and_invalid_downloads_are_not_saved() {
+        let root = std::env::temp_dir().join(format!(
+            "skin-cache-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("skin");
+        std::fs::write(&file, b"broken PNG").unwrap();
+        let mut png_bytes = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut png_bytes, 64, 64);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder
+                .write_header()
+                .unwrap()
+                .write_image_data(&vec![255; 64 * 64 * 4])
+                .unwrap();
+        }
+        assert!(
+            super::cached_texture(&file, super::Kind::Skin, || Some(png_bytes.clone())).is_some()
+        );
+        assert_eq!(std::fs::read(&file).unwrap(), png_bytes);
+        assert!(
+            super::cached_texture(&file, super::Kind::Skin, || panic!(
+                "valid cache must not fetch"
+            ))
+            .is_some()
+        );
+        let missing = root.join("missing");
+        assert!(
+            super::cached_texture(&missing, super::Kind::Skin, || Some(b"HTTP error".to_vec()))
+                .is_none()
+        );
+        assert!(!missing.exists());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// A skin evicted from the atlas re-uploads (`again`), once per ask.

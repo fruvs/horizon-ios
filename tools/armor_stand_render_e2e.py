@@ -6,11 +6,12 @@ real saves, Microsoft sessions or public servers are used.
 """
 import argparse
 import json
-import os
 from pathlib import Path
 import subprocess
 import tempfile
 import time
+
+import lab
 
 
 def main():
@@ -25,13 +26,12 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='hz-armor-', dir='/tmp') as scratch:
         root = Path(scratch)
-        env = os.environ.copy()
+        env = lab.game_env()
         for key in ('HORIZON_HOME', 'HORIZON_LAUNCHER_HOME', 'XDG_DATA_HOME', 'XDG_CONFIG_HOME',
                     'HORIZON_LAUNCHER_TRASH', 'HORIZON_LAUNCHER_CLIPBOARD', 'HORIZON_LAUNCHER_DESKTOP'):
             folder = root / key.lower()
             folder.mkdir()
             env[key] = str(folder)
-        env.update(HORIZON_LAUNCHER_NO_SELF_UPDATE='1', HORIZON_NO_AUDIO='1')
         socket = str(root / 'ctl.sock')
 
         def call(*words):

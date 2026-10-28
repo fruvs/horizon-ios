@@ -265,6 +265,7 @@ pub(super) struct Remote {
     tab_players: HashMap<u128, horizon_client::tab_list::TabPlayer>,
     /// Profile textures, retained for living NPC entities even after tab-list removal.
     skin_textures: HashMap<u128, horizon_client::skins::Textures>,
+    dimension_key: Option<String>,
     /// The skin texture each profile's players show, once its download is ready.
     skins: HashMap<u128, String>,
     /// Skins from Ely.by for the players who came without one (`skins::ElySkins`).
@@ -577,6 +578,7 @@ impl Game<'_> {
             players: HashMap::new(),
             tab_players: HashMap::new(),
             skin_textures: HashMap::new(),
+            dimension_key: None,
             skins: HashMap::new(),
             ely_skins: Default::default(),
             listed: Default::default(),
@@ -1114,7 +1116,9 @@ impl Game<'_> {
             return;
         };
         let dimension = r.registries.dimension(spawn.dimension_type);
-        let same = r.dimension.name == dimension.name && keep_world;
+        let same = same_remote_world(r.dimension_key.as_deref(), &spawn.dimension, keep_world)
+            && r.dimension.name == dimension.name;
+        r.dimension_key = Some(spawn.dimension.clone());
         r.chunk_format = Arc::new(r.chunk_format.with_dimension(&dimension));
         r.dimension = dimension;
         r.game_mode = spawn.game_type;
@@ -6372,6 +6376,10 @@ impl Remote {
     }
 }
 
+fn same_remote_world(previous: Option<&str>, next: &str, keep: bool) -> bool {
+    keep && previous == Some(next)
+}
+
 /// A repeated ADD_PLAYER carries the new profile, rather than freezing the first skin forever.
 fn replace_remote_skin(
     uuid: u128,
@@ -6407,6 +6415,26 @@ fn prune_remote_skin(
 #[cfg(test)]
 mod tests {
     use super::Game;
+
+    #[test]
+    fn remote_world_identity_is_not_its_shared_dimension_type() {
+        assert!(!super::same_remote_world(
+            Some("server:lobby"),
+            "server:island",
+            true
+        ));
+        assert!(super::same_remote_world(
+            Some("server:island"),
+            "server:island",
+            true
+        ));
+        assert!(!super::same_remote_world(None, "minecraft:overworld", true));
+        assert!(!super::same_remote_world(
+            Some("server:island"),
+            "server:island",
+            false
+        ));
+    }
 
     #[test]
     fn refreshed_npc_profiles_replace_stale_textures_without_dropping_identical_ones() {

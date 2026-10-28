@@ -134,11 +134,7 @@ impl Game<'_> {
                 let Some(f) = self.item_frames.iter_mut().find(|f| f.id == id) else {
                     continue;
                 };
-                match (index, value) {
-                    (8, Value::Id(d)) => f.facing = (*d).clamp(0, 5) as u8,
-                    (10, Value::Int(r)) => f.rotation = r.rem_euclid(8) as u8,
-                    _ => {}
-                }
+                apply_frame_metadata(f, *index, value);
                 if let Some(item) = item {
                     f.item = item;
                 }
@@ -326,6 +322,7 @@ impl Game<'_> {
         self.cushions.clear();
         self.item_frames.clear();
         self.paintings.clear();
+        self.bolts.clear();
     }
 
     pub(super) fn remove_remote_object(&mut self, id: u32) {
@@ -338,5 +335,51 @@ impl Game<'_> {
         self.item_frames.retain(|f| f.id != id);
         self.paintings.retain(|p| p.id != id);
         self.bolts.retain(|b| b.id != id);
+    }
+}
+
+/// ItemFrame inherits Entity's shared flags, including invisibility. Updates
+/// are partial: unrelated metadata must leave the last visibility unchanged.
+fn apply_frame_metadata(frame: &mut ItemFrame, index: u8, value: &Value) {
+    match (index, value) {
+        (0, Value::Byte(flags)) => frame.invisible = flags & 0x20 != 0,
+        (8, Value::Id(direction)) => frame.facing = (*direction).clamp(0, 5) as u8,
+        (10, Value::Int(rotation)) => frame.rotation = rotation.rem_euclid(8) as u8,
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frame_visibility_follows_partial_metadata_and_can_be_reset() {
+        for glow in [false, true] {
+            let mut frame = ItemFrame {
+                id: 7,
+                pos: [0, 64, 0],
+                facing: 3,
+                glow,
+                item: None,
+                rotation: 0,
+                drop_chance: 1.0,
+                fixed: false,
+                invisible: false,
+                check_interval: 0,
+            };
+            apply_frame_metadata(&mut frame, 0, &Value::Byte(0x20));
+            assert!(frame.invisible);
+            apply_frame_metadata(&mut frame, 8, &Value::Id(4));
+            apply_frame_metadata(&mut frame, 10, &Value::Int(3));
+            assert!(frame.invisible);
+            assert_eq!((frame.facing, frame.rotation), (4, 3));
+            // Other shared flags do not imply invisibility.
+            apply_frame_metadata(&mut frame, 0, &Value::Byte(0x40));
+            assert!(!frame.invisible);
+            apply_frame_metadata(&mut frame, 0, &Value::Byte(0x20));
+            apply_frame_metadata(&mut frame, 0, &Value::Byte(0));
+            assert!(!frame.invisible);
+        }
     }
 }

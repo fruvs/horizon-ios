@@ -203,6 +203,10 @@ impl Game<'_> {
                 _ => 0.0,
             };
             e.data = i32::from(f.facing);
+            // Entity.DATA_SHARED_FLAGS_ID: ItemFrame inherits invisibility.
+            if f.invisible {
+                e.meta.push((0, serializer::BYTE, Value::Byte(0x20)));
+            }
             // HangingEntity.DATA_DIRECTION, south by default.
             if f.facing != 3 {
                 e.meta
