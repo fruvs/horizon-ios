@@ -136,6 +136,8 @@ struct SettingsPage: View {
     @ObservedObject var download: GameFilesDownload
     @StateObject private var model = GameOptions()
     @State private var showingNews = false
+    @State private var expanded: Set<String> = ["Video"]
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -159,22 +161,46 @@ struct SettingsPage: View {
             ForEach(GameOptions.groups, id: \.title) { group in
                 let rows = group.rows.filter { model.options[$0.key] != nil }
                 if !rows.isEmpty {
-                    SectionHeader(title: group.title) {
-                        Image(systemName: group.icon).foregroundStyle(Theme.textFaint)
-                    }
                     VStack(spacing: 0) {
-                        ForEach(rows, id: \.key) { row in
-                            if let option = model.options[row.key] {
-                                OptionRow(row: row, option: option) { value in
-                                    Task {
-                                        if let error = await model.set(row.key, value) { link.problem = error }
+                        Button {
+                            withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.2)) {
+                                if expanded.contains(group.title) { expanded.remove(group.title) }
+                                else { expanded.insert(group.title) }
+                            }
+                        } label: {
+                            HStack(spacing: 14) {
+                                Image(systemName: group.icon).font(.system(size: 21, weight: .medium))
+                                    .foregroundStyle(group.title == "Sound" ? .orange : group.title == "Controls" ? .indigo : Theme.accent)
+                                    .frame(width: 48, height: 48)
+                                    .background(Theme.surfaceSunken, in: RoundedRectangle(cornerRadius: 16))
+                                VStack(alignment: .leading, spacing: 5) {
+                                    Text(group.title).font(.system(.title3, design: .rounded).weight(.semibold)).foregroundStyle(Theme.text)
+                                    Text(group.title == "Video" ? "Graphics & performance" : group.title == "Sound" ? "Volume & ambience" : "Movement & input")
+                                        .font(.caption).foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                                Image(systemName: expanded.contains(group.title) ? "chevron.up" : "chevron.down")
+                                    .font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                            }.padding(18).contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityIdentifier("settings-group-" + group.title.lowercased())
+                        .accessibilityValue(expanded.contains(group.title) ? "Expanded" : "Collapsed")
+                        if expanded.contains(group.title) {
+                            Divider().padding(.horizontal, 18)
+                            VStack(spacing: 2) {
+                                ForEach(rows, id: \.key) { row in
+                                    if let option = model.options[row.key] {
+                                        OptionRow(row: row, option: option) { value in
+                                            Task { if let error = await model.set(row.key, value) { link.problem = error } }
+                                        }
                                     }
                                 }
-                                if row.key != rows.last?.key { Divider().padding(.leading, 14) }
-                            }
+                            }.padding(.vertical, 8)
                         }
                     }
-                    .card()
+                    .background(Theme.surface, in: RoundedRectangle(cornerRadius: 26))
+                    .overlay(RoundedRectangle(cornerRadius: 26).strokeBorder(Theme.border.opacity(0.5)))
                     .disabled(model.loading || model.issue != nil)
                 }
             }
@@ -212,6 +238,8 @@ private struct OptionRow: View {
                     title
                 }
                 .tint(Theme.accent)
+                .accessibilityLabel(row.title)
+                .accessibilityIdentifier("setting-" + row.key)
             case "enum":
                 choice(option.choices.map { ($0, row.names[$0] ?? $0.capitalized) }, current: option.text)
             case "int" where !row.names.isEmpty:
@@ -223,7 +251,6 @@ private struct OptionRow: View {
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
         .frame(minHeight: 50)
-        .accessibilityIdentifier("setting-" + row.key)
     }
 
     private var title: some View {
@@ -268,7 +295,8 @@ private struct OptionRow: View {
             HStack {
                 title
                 Spacer()
-                Text(row.format(shown)).font(Theme.mono(11)).foregroundStyle(Theme.accentText)
+                Text(row.format(shown)).font(.caption.monospacedDigit().weight(.semibold)).foregroundStyle(Theme.accentText)
+                    .padding(.horizontal, 9).padding(.vertical, 5).background(Theme.notice, in: Capsule())
             }
             Slider(
                 value: Binding(get: { Swift.min(Swift.max(shown, low), high) }, set: { dragging = $0 }),
@@ -283,6 +311,8 @@ private struct OptionRow: View {
                 }
             )
             .tint(Theme.accent)
+            .accessibilityLabel(row.title)
+            .accessibilityIdentifier("setting-" + row.key)
         }
     }
 }

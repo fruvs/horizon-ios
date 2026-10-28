@@ -9,17 +9,23 @@ final class Kit {
 /// Semantic UIKit colors adapt to appearance, contrast and accessibility settings.
 /// Legacy type helper names remain so all launcher pages share the native typography.
 enum Theme {
-    static let background = Color(uiColor: .systemGroupedBackground)
-    static let surface = Color(uiColor: .secondarySystemGroupedBackground)
+    static let background = Color(uiColor: UIColor { traits in
+        traits.userInterfaceStyle == .dark ? UIColor(red: 0.035, green: 0.055, blue: 0.075, alpha: 1) : UIColor(red: 0.94, green: 0.96, blue: 0.97, alpha: 1)
+    })
+    static let surface = Color(uiColor: UIColor { traits in
+        traits.userInterfaceStyle == .dark ? UIColor(red: 0.075, green: 0.10, blue: 0.125, alpha: 1) : .white
+    })
     static let surfaceSunken = Color(uiColor: .tertiarySystemGroupedBackground)
     static let surfaceDisabled = Color(uiColor: .tertiarySystemFill)
     static let border = Color(uiColor: .separator).opacity(0.28)
-    static let accent = Color.blue
-    static let accentEdge = Color.blue
-    static let accentBright = Color.blue
-    static let accentText = Color.blue
-    static let notice = Color.blue.opacity(0.10)
-    static let noticeBorder = Color.blue.opacity(0.18)
+    static let accent = Color(uiColor: UIColor { traits in
+        traits.userInterfaceStyle == .dark ? UIColor(red: 0.34, green: 0.85, blue: 0.79, alpha: 1) : UIColor(red: 0.025, green: 0.40, blue: 0.44, alpha: 1)
+    })
+    static let accentEdge = accent
+    static let accentBright = accent
+    static let accentText = accent
+    static let notice = accent.opacity(0.12)
+    static let noticeBorder = accent.opacity(0.18)
     static let ready = Color.green
     static let warn = Color.orange
     static let danger = Color.red
@@ -76,4 +82,23 @@ extension View {
         if #available(iOS 26.0, *) { self.buttonStyle(.glass) }
         else { self.buttonStyle(.bordered) }
     }
+}
+
+private struct FloatingNavigationMaterial: ViewModifier {
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @ViewBuilder func body(content: Content) -> some View {
+        if reduceTransparency {
+            content.background(Theme.surface, in: Capsule()).overlay(Capsule().strokeBorder(Theme.border))
+        } else if #available(iOS 26.0, *) {
+            content.glassEffect(.regular.interactive(), in: .capsule)
+                .shadow(color: .black.opacity(0.14), radius: 18, y: 8)
+        } else {
+            content.background(.regularMaterial, in: Capsule())
+                .overlay(Capsule().strokeBorder(.white.opacity(0.16)))
+                .shadow(color: .black.opacity(0.18), radius: 18, y: 8)
+        }
+    }
+}
+extension View {
+    func floatingNavigationGlass() -> some View { modifier(FloatingNavigationMaterial()) }
 }

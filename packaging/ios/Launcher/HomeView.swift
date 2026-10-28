@@ -11,6 +11,8 @@ struct HomeView: View {
     @StateObject private var account = MicrosoftAccount()
     @Environment(\.horizontalSizeClass) private var sizeClass
     @State private var tab = Destination.play
+    @Namespace private var dockSelection
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     private enum Sheet: String, Identifiable { case account, newWorld; var id: String { rawValue } }
     @State private var sheet: Sheet?
     @State private var editingName = false
@@ -38,12 +40,30 @@ struct HomeView: View {
         Group {
             if sizeClass == .regular {
                 NavigationSplitView {
-                    List(Destination.allCases, selection: Binding<Destination?>(
-                        get: { tab }, set: { if let value = $0 { tab = value } }
-                    )) { item in
-                        Label(item.title, systemImage: item.icon).tag(item)
+                    VStack(alignment: .leading, spacing: 28) {
+                        HStack(spacing: 12) {
+                            Kit.image("horizon-mark").resizable().renderingMode(.template).scaledToFit().frame(width: 32, height: 32)
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text("Horizon").font(.system(.title3, design: .rounded).bold())
+                                Text("JAVA EDITION").font(.caption2.weight(.medium)).tracking(1.5).foregroundStyle(.secondary)
+                            }
+                        }.padding(.horizontal, 12)
+                        VStack(spacing: 8) {
+                            ForEach(Destination.allCases) { item in
+                                Button { tab = item } label: {
+                                    Label(item.title, systemImage: item.icon)
+                                        .font(.system(.body, design: .rounded).weight(tab == item ? .semibold : .medium))
+                                        .frame(maxWidth: .infinity, minHeight: 52, alignment: .leading)
+                                        .padding(.horizontal, 16)
+                                        .foregroundStyle(tab == item ? Theme.accent : Theme.textMuted)
+                                        .background(tab == item ? Theme.notice : .clear, in: RoundedRectangle(cornerRadius: 18))
+                                }.buttonStyle(.plain).accessibilityIdentifier("launcher-nav-" + item.rawValue)
+                            }
+                        }
+                        Spacer()
                     }
-                    .navigationTitle("Horizon")
+                    .padding(20).padding(.top, 12)
+                    .background(Theme.background)
                     .navigationSplitViewColumnWidth(min: 210, ideal: 240, max: 280)
                     .accessibilityIdentifier("launcher-navigation-rail")
                 } detail: {
@@ -51,16 +71,19 @@ struct HomeView: View {
                 }
                 .navigationSplitViewStyle(.balanced)
             } else {
-                TabView(selection: $tab) {
-                    ForEach(Destination.allCases) { item in
-                        NavigationStack { destination(item) }
-                            .tabItem { Label(item.title, systemImage: item.icon) }
-                            .tag(item)
+                NavigationStack { destination(tab) }
+                    .id(tab)
+                    .safeAreaInset(edge: .bottom, spacing: 0) {
+                        floatingDock
+                            .padding(.horizontal, 20)
+                            .padding(.top, 8)
+                            .padding(.bottom, 18)
                     }
-                }
+
             }
         }
-        .tint(.blue)
+        .background(Theme.background.ignoresSafeArea())
+        .tint(Theme.accent)
         .sheet(item: Binding<Sheet?>(
             get: { sizeClass == .regular || sheet == .account ? sheet : nil },
             set: { sheet = $0 }
@@ -96,6 +119,52 @@ struct HomeView: View {
         .task { link.uncover = onPlay; await link.watch() }
     }
 
+    private var floatingDock: some View {
+        HStack(spacing: 2) {
+            ForEach(Destination.allCases) { item in
+                Button {
+                    Haptics.tap()
+                    tab = item
+                } label: {
+                    VStack(spacing: 5) {
+                        Image(systemName: item.icon).font(.system(size: 20, weight: tab == item ? .semibold : .regular))
+                        Text(item.title).font(.caption2.weight(tab == item ? .semibold : .medium)).lineLimit(1)
+                    }
+                    .foregroundStyle(tab == item ? Theme.accent : Theme.textMuted)
+                    .frame(maxWidth: .infinity, minHeight: 58)
+                    .background {
+                        if tab == item {
+                            Capsule().fill(Theme.accent.opacity(0.14))
+                                .matchedGeometryEffect(id: "dock-selection", in: dockSelection)
+                        }
+                    }
+                    .contentShape(Capsule())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(item.title)
+                .accessibilityAddTraits(tab == item ? .isSelected : [])
+                .accessibilityIdentifier("launcher-nav-" + item.rawValue)
+            }
+        }
+        .padding(7)
+        .frame(maxWidth: 460)
+        .floatingNavigationGlass()
+        .animation(reduceMotion ? nil : .spring(response: 0.35, dampingFraction: 0.8), value: tab)
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("launcher-floating-dock")
+    }
+
+    private func pageHeading(_ item: Destination) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("HORIZON\(item == .play ? " / JAVA EDITION" : "")")
+                .font(.caption2.weight(.semibold)).tracking(2).foregroundStyle(Theme.accent)
+            Text(item.title).font(.system(.largeTitle, design: .rounded).bold())
+            if item == .settings {
+                Text("Display, sound & the way you play").font(.subheadline).foregroundStyle(.secondary)
+            }
+        }
+    }
+
     private var shownName: String? { account.profile?.name ?? player.name }
 
     private func editName() {
@@ -106,22 +175,27 @@ struct HomeView: View {
 
     private func destination(_ item: Destination) -> some View {
         page {
-            switch item {
-            case .play: home
-            case .worlds: WorldsSection(link: link, newWorld: { sheet = .newWorld })
-            case .servers: ServersPage(link: link, account: account)
-            case .packs: PacksPage(link: link)
-            case .settings:
-                VStack(spacing: 24) {
-                    SettingsPage(link: link, download: download)
-                    NavigationLink { page { GalleryPage() }.navigationTitle("Screenshots") } label: {
-                        Label("Screenshots", systemImage: "photo.on.rectangle")
-                            .frame(maxWidth: .infinity, alignment: .leading).padding(16).card()
+            VStack(alignment: .leading, spacing: 26) {
+                pageHeading(item)
+                switch item {
+                case .play: home
+                case .worlds: WorldsSection(link: link, newWorld: { sheet = .newWorld })
+                case .servers: ServersPage(link: link, account: account)
+                case .packs: PacksPage(link: link)
+                case .settings:
+                    VStack(spacing: 24) {
+                        SettingsPage(link: link, download: download)
+                        NavigationLink { page { GalleryPage() }.navigationTitle("Screenshots") } label: {
+                            Label("Screenshots", systemImage: "photo.on.rectangle")
+                                .frame(maxWidth: .infinity, alignment: .leading).padding(16).card()
+                        }
                     }
                 }
             }
         }
-        .navigationTitle(item.title)
+        .navigationTitle("")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbarBackground(.hidden, for: .navigationBar)
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 Button { sheet = .account } label: {
@@ -201,7 +275,7 @@ struct HomeView: View {
                 }
                 .controlSize(.large)
                 .launcherPrimaryButton()
-                .tint(.blue)
+                .tint(Theme.accent)
                 .disabled(needsFiles || link.launching != nil)
                 .accessibilityIdentifier("launcher-play-button")
                 if link.launching != nil {
@@ -273,7 +347,7 @@ struct HomeView: View {
                 HStack {
                     Image(systemName: icon).font(.title2.weight(.medium))
                         .frame(width: 44, height: 44)
-                        .foregroundStyle(.blue).background(.blue.opacity(0.10), in: RoundedRectangle(cornerRadius: 14))
+                        .foregroundStyle(Theme.accent).background(Theme.accent.opacity(0.10), in: RoundedRectangle(cornerRadius: 14))
                     Spacer(minLength: 0)
                     Image(systemName: "arrow.up.right").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
                 }

@@ -27,10 +27,10 @@ final class LauncherLayoutTests: XCTestCase {
         XCTAssertTrue(app.staticTexts["Microsoft account"].firstMatch.waitForExistence(timeout: 5))
         XCTAssertFalse(app.buttons["Change Offline Name"].exists)
         app.buttons["Done"].tap()
-        if app.tabBars.buttons["Worlds"].exists {
-            app.tabBars.buttons["Worlds"].tap()
+        if app.buttons["launcher-nav-worlds"].exists {
+            app.buttons["launcher-nav-worlds"].tap()
             XCTAssertTrue(app.buttons["new-world-button"].waitForExistence(timeout: 5))
-            app.tabBars.buttons["Play"].tap()
+            app.buttons["launcher-nav-play"].tap()
         }
         let shot = XCTAttachment(screenshot: app.screenshot()); shot.name = "Native-launcher"; shot.lifetime = .keepAlways; add(shot)
     }
@@ -47,7 +47,7 @@ final class LauncherLayoutTests: XCTestCase {
     func testWorldLibraryAndHardcoreOptions() {
         XCUIDevice.shared.orientation = .portrait
         let app = launch(signedIn: true)
-        if app.tabBars.buttons["Worlds"].exists { app.tabBars.buttons["Worlds"].tap() }
+        if app.buttons["launcher-nav-worlds"].exists { app.buttons["launcher-nav-worlds"].tap() }
         else { app.buttons["All Worlds"].tap() }
         let newWorld = app.buttons["new-world-button"]
         XCTAssertTrue(newWorld.waitForExistence(timeout: 5)); newWorld.tap()
@@ -63,39 +63,77 @@ final class LauncherLayoutTests: XCTestCase {
 
     func testSettingsControlsLoadAndTogglePersistsAcrossNavigation() {
         let app = launch(signedIn: false)
-        app.tabBars.buttons["Settings"].tap()
+        app.buttons["launcher-nav-settings"].tap()
         XCTAssertTrue(app.staticTexts["Graphics"].waitForExistence(timeout: 8))
         XCTAssertTrue(app.staticTexts["Render Distance"].exists)
         for _ in 0..<5 {
+            if app.buttons["settings-group-sound"].isHittable && app.buttons["settings-group-sound"].frame.maxY < app.frame.maxY - 180 { break }
+            app.scrollViews.firstMatch.coordinate(withNormalizedOffset: CGVector(dx: 0.03, dy: 0.70))
+                .press(forDuration: 0.05, thenDragTo: app.scrollViews.firstMatch.coordinate(withNormalizedOffset: CGVector(dx: 0.03, dy: 0.40)))
+        }
+        if app.buttons["settings-group-sound"].value as? String != "Expanded" { app.buttons["settings-group-sound"].tap() }
+        XCTAssertEqual(app.buttons["settings-group-sound"].value as? String, "Expanded")
+        for _ in 0..<5 {
             if app.staticTexts["Master Volume"].isHittable { break }
-            app.swipeUp()
+            app.scrollViews.firstMatch.coordinate(withNormalizedOffset: CGVector(dx: 0.03, dy: 0.70))
+                .press(forDuration: 0.05, thenDragTo: app.scrollViews.firstMatch.coordinate(withNormalizedOffset: CGVector(dx: 0.03, dy: 0.40)))
         }
         XCTAssertTrue(app.staticTexts["Master Volume"].isHittable)
         for _ in 0..<5 {
-            if app.switches["Auto-Jump"].isHittable { break }
-            app.swipeUp()
+            if app.buttons["settings-group-controls"].isHittable && app.buttons["settings-group-controls"].frame.maxY < app.frame.maxY - 180 { break }
+            app.scrollViews.firstMatch.coordinate(withNormalizedOffset: CGVector(dx: 0.03, dy: 0.70))
+                .press(forDuration: 0.05, thenDragTo: app.scrollViews.firstMatch.coordinate(withNormalizedOffset: CGVector(dx: 0.03, dy: 0.40)))
         }
-        let toggle = app.switches["Auto-Jump"]
+        if app.buttons["settings-group-controls"].value as? String != "Expanded" { app.buttons["settings-group-controls"].tap() }
+        XCTAssertEqual(app.buttons["settings-group-controls"].value as? String, "Expanded")
+        for _ in 0..<5 {
+            if app.switches["setting-autoJump"].isHittable { break }
+            app.scrollViews.firstMatch.coordinate(withNormalizedOffset: CGVector(dx: 0.03, dy: 0.70))
+                .press(forDuration: 0.05, thenDragTo: app.scrollViews.firstMatch.coordinate(withNormalizedOffset: CGVector(dx: 0.03, dy: 0.40)))
+        }
+        let toggle = app.switches["setting-autoJump"]
         XCTAssertTrue(toggle.isHittable)
         let before = toggle.value as? String
         toggle.tap()
         XCTAssertNotEqual(toggle.value as? String, before)
         let after = toggle.value as? String
-        app.tabBars.buttons["Play"].tap()
-        app.tabBars.buttons["Settings"].tap()
+        app.buttons["launcher-nav-play"].tap()
+        app.buttons["launcher-nav-settings"].tap()
         for _ in 0..<5 {
-            if toggle.isHittable { break }
-            app.swipeUp()
+            if app.buttons["settings-group-controls"].isHittable && app.buttons["settings-group-controls"].frame.maxY < app.frame.maxY - 180 { break }
+            app.scrollViews.firstMatch.coordinate(withNormalizedOffset: CGVector(dx: 0.03, dy: 0.70))
+                .press(forDuration: 0.05, thenDragTo: app.scrollViews.firstMatch.coordinate(withNormalizedOffset: CGVector(dx: 0.03, dy: 0.40)))
         }
-        XCTAssertEqual(toggle.value as? String, after)
+        if app.buttons["settings-group-controls"].value as? String != "Expanded" { app.buttons["settings-group-controls"].tap() }
+        XCTAssertEqual(app.buttons["settings-group-controls"].value as? String, "Expanded")
+        for _ in 0..<5 {
+            if app.switches.matching(identifier: "setting-autoJump").firstMatch.isHittable { break }
+            app.scrollViews.firstMatch.coordinate(withNormalizedOffset: CGVector(dx: 0.03, dy: 0.70))
+                .press(forDuration: 0.05, thenDragTo: app.scrollViews.firstMatch.coordinate(withNormalizedOffset: CGVector(dx: 0.03, dy: 0.40)))
+        }
+        XCTAssertEqual(app.switches.matching(identifier: "setting-autoJump").firstMatch.value as? String, after)
     }
 
     func testSettingsEmptyResponseShowsRetry() {
         let app = launch(signedIn: false, optionsResponse: "empty")
-        app.tabBars.buttons["Settings"].tap()
+        app.buttons["launcher-nav-settings"].tap()
         XCTAssertTrue(app.buttons["settings-retry"].waitForExistence(timeout: 8))
         XCTAssertFalse(app.staticTexts["Video"].exists)
         XCTAssertTrue(app.staticTexts["Settings couldn’t load"].exists)
+    }
+
+    func testFloatingDockHasBottomAndSideClearanceAndNavigates() {
+        let app = launch(signedIn: false)
+        let dock = app.otherElements["launcher-floating-dock"]
+        XCTAssertTrue(dock.exists)
+        XCTAssertGreaterThan(dock.frame.minX - app.frame.minX, 10)
+        XCTAssertGreaterThan(app.frame.maxX - dock.frame.maxX, 10)
+        XCTAssertGreaterThan(app.frame.maxY - dock.frame.maxY, 24)
+        for page in ["worlds", "servers", "packs", "settings", "play"] {
+            let button = app.buttons["launcher-nav-" + page]
+            XCTAssertTrue(button.isHittable); button.tap()
+            XCTAssertTrue(app.buttons["launcher-nav-" + page].isSelected)
+        }
     }
 
 }
