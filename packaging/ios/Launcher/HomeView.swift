@@ -11,8 +11,6 @@ struct HomeView: View {
     @StateObject private var account = MicrosoftAccount()
     @Environment(\.horizontalSizeClass) private var sizeClass
     @State private var tab = Destination.play
-    @Namespace private var dockSelection
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var showingAccount = false
     @State private var editingName = false
     @State private var nameDraft = ""
@@ -68,19 +66,13 @@ struct HomeView: View {
                 }
                 .navigationSplitViewStyle(.balanced)
             } else {
-                ZStack(alignment: .bottom) {
-                    NavigationStack { destination(tab) }
-                        .id(tab)
-                        // Keep the final scroll content above the floating control.
-                        .safeAreaInset(edge: .bottom, spacing: 0) {
-                            Color.clear.frame(height: 92).allowsHitTesting(false)
-                        }
-                    floatingDock
-                        .padding(.horizontal, 20)
-                        // Measured from the screen edge, not added to the home safe area.
-                        .padding(.bottom, 22)
+                TabView(selection: $tab) {
+                    ForEach(Destination.allCases) { item in
+                        NavigationStack { destination(item) }
+                            .tabItem { Label(item.title, systemImage: item.icon) }
+                            .tag(item)
+                    }
                 }
-                .ignoresSafeArea(.container, edges: .bottom)
 
             }
         }
@@ -107,41 +99,6 @@ struct HomeView: View {
             if profile != nil { editingName = false; nameDraft = "" }
         }
         .task { link.uncover = onPlay; await link.watch() }
-    }
-
-    private var floatingDock: some View {
-        HStack(spacing: 2) {
-            ForEach(Destination.allCases) { item in
-                Button {
-                    Haptics.tap()
-                    tab = item
-                } label: {
-                    VStack(spacing: 5) {
-                        Image(systemName: item.icon).font(.system(size: 20, weight: tab == item ? .semibold : .regular))
-                        Text(item.title).font(.caption2.weight(tab == item ? .semibold : .medium)).lineLimit(1)
-                    }
-                    .foregroundStyle(tab == item ? Theme.accent : Theme.textMuted)
-                    .frame(maxWidth: .infinity, minHeight: 52)
-                    .background {
-                        if tab == item {
-                            Capsule().fill(Theme.accent.opacity(0.14))
-                                .matchedGeometryEffect(id: "dock-selection", in: dockSelection)
-                        }
-                    }
-                    .contentShape(Capsule())
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel(item.title)
-                .accessibilityAddTraits(tab == item ? .isSelected : [])
-                .accessibilityIdentifier("launcher-nav-" + item.rawValue)
-            }
-        }
-        .padding(6)
-        .frame(maxWidth: 280)
-        .floatingNavigationGlass()
-        .animation(reduceMotion ? nil : .spring(response: 0.35, dampingFraction: 0.8), value: tab)
-        .accessibilityElement(children: .contain)
-        .accessibilityIdentifier("launcher-floating-dock")
     }
 
     private func pageHeading(_ item: Destination) -> some View {

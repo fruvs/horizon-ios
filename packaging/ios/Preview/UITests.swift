@@ -44,7 +44,7 @@ final class LauncherLayoutTests: XCTestCase {
     }
     func testSettingsControlsLoadAndTogglePersistsAcrossNavigation() {
         let app = launch(signedIn: false)
-        app.buttons["launcher-nav-settings"].tap()
+        app.tabBars.buttons["Settings"].tap()
         XCTAssertTrue(app.staticTexts["Graphics"].waitForExistence(timeout: 8))
         XCTAssertTrue(app.staticTexts["Render Distance"].exists)
         for _ in 0..<5 {
@@ -78,8 +78,8 @@ final class LauncherLayoutTests: XCTestCase {
         toggle.tap()
         XCTAssertNotEqual(toggle.value as? String, before)
         let after = toggle.value as? String
-        app.buttons["launcher-nav-play"].tap()
-        app.buttons["launcher-nav-settings"].tap()
+        app.tabBars.buttons["Play"].tap()
+        app.tabBars.buttons["Settings"].tap()
         for _ in 0..<5 {
             if app.buttons["settings-group-controls"].isHittable && app.buttons["settings-group-controls"].frame.maxY < app.frame.maxY - 180 { break }
             app.scrollViews.firstMatch.coordinate(withNormalizedOffset: CGVector(dx: 0.03, dy: 0.70))
@@ -97,34 +97,29 @@ final class LauncherLayoutTests: XCTestCase {
 
     func testSettingsEmptyResponseShowsRetry() {
         let app = launch(signedIn: false, optionsResponse: "empty")
-        app.buttons["launcher-nav-settings"].tap()
+        app.tabBars.buttons["Settings"].tap()
         XCTAssertTrue(app.buttons["settings-retry"].waitForExistence(timeout: 8))
         XCTAssertFalse(app.staticTexts["Video"].exists)
         XCTAssertTrue(app.staticTexts["Settings couldn’t load"].exists)
     }
 
-    func testFloatingDockHasBottomAndSideClearanceAndNavigates() {
+    func testNativeTabBarHasOnlyThreeDestinationsAndNavigates() {
         let app = launch(signedIn: false)
-        let dock = app.otherElements["launcher-floating-dock"]
-        XCTAssertTrue(dock.exists)
-        XCTAssertGreaterThan(dock.frame.minX - app.frame.minX, 10)
-        XCTAssertGreaterThan(app.frame.maxX - dock.frame.maxX, 10)
-        let bottomClearance = app.frame.maxY - dock.frame.maxY
-        XCTAssertEqual(bottomClearance, 22, accuracy: 2)
-        let measurement = XCTAttachment(string: "Dock frame: \(dock.frame); app frame: \(app.frame); bottom clearance: \(bottomClearance) points")
-        measurement.name = "Dock screen-edge measurement"; measurement.lifetime = .keepAlways; add(measurement)
-        let image = XCTAttachment(screenshot: app.screenshot())
-        image.name = "Lowered three-item navigation"; image.lifetime = .keepAlways; add(image)
-        XCTAssertLessThanOrEqual(dock.frame.width, 281)
-        XCTAssertFalse(app.buttons["launcher-nav-worlds"].exists)
-        XCTAssertFalse(app.buttons["launcher-nav-servers"].exists)
+        let bar = app.tabBars.firstMatch
+        XCTAssertTrue(bar.waitForExistence(timeout: 5))
+        XCTAssertEqual(bar.buttons.count, 3)
+        XCTAssertFalse(bar.buttons["Worlds"].exists)
+        XCTAssertFalse(bar.buttons["Servers"].exists)
+        XCTAssertFalse(app.otherElements["launcher-floating-dock"].exists)
         XCTAssertFalse(app.staticTexts["All Worlds"].exists)
         XCTAssertFalse(app.staticTexts["Jump back in"].exists)
-        for page in ["packs", "settings", "play"] {
-            let button = app.buttons["launcher-nav-" + page]
+        for page in ["Packs", "Settings", "Play"] {
+            let button = bar.buttons[page]
             XCTAssertTrue(button.isHittable); button.tap()
-            XCTAssertTrue(app.buttons["launcher-nav-" + page].isSelected)
+            XCTAssertTrue(bar.buttons[page].isSelected)
         }
+        let image = XCTAttachment(screenshot: app.screenshot())
+        image.name = "Native three-tab navigation"; image.lifetime = .keepAlways; add(image)
     }
 
     func testAccountControlIsCircularAndLibraryRoutesAreAbsent() {
