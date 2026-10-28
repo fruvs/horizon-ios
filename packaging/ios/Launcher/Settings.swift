@@ -29,21 +29,53 @@ struct GameOption {
 /// `options-set`): a change applies at once and is saved, as the game's own Options screen does it.
 @MainActor
 final class GameOptions: ObservableObject {
+    typealias Request = @MainActor (String) async -> [String: Any]
     @Published private(set) var options: [String: GameOption] = [:]
+    @Published private(set) var loading = false
+    @Published private(set) var issue: String?
+    @Published private(set) var unavailable: [String] = []
+    private let request: Request
+
+    init(request: @escaping Request = { await Bridge.send($0) }) { self.request = request }
 
     func load() async {
-        let keys = Self.groups.flatMap { $0.rows.map(\.key) }
-        let answer = await Bridge.send("options-get " + keys.joined(separator: " "))
-        guard let described = answer["options"] as? [String: [String: Any]] else { return }
-        options = described.compactMapValues(GameOption.init)
+        loading = true
+        issue = nil
+        defer { loading = false }
+        let rows = Self.groups.flatMap(\.rows)
+        let keys = rows.map(\.key)
+        let answer = await request("options-get " + keys.joined(separator: " "))
+        var described = answer["options"] as? [String: [String: Any]]
+        // One unsupported key must not hide every supported control on a different engine revision.
+        if let error = answer.error, error.hasPrefix("unknown option") {
+            var supported: [String: [String: Any]] = [:]
+            for key in keys {
+                let one = await request("options-get " + key)
+                if let value = (one["options"] as? [String: [String: Any]])?[key] { supported[key] = value }
+            }
+            described = supported
+        } else if let error = answer.error {
+            issue = error
+            return
+        }
+        let parsed = (described ?? [:]).compactMapValues(GameOption.init)
+            .filter { keys.contains($0.key) }
+        guard !parsed.isEmpty else {
+            issue = "The launcher did not receive any settings. Try loading them again."
+            return
+        }
+        options = parsed
+        unavailable = rows.filter { parsed[$0.key] == nil }.map(\.title)
     }
 
     func set(_ key: String, _ value: String) async -> String? {
-        let answer = await Bridge.send("options-set \(key) \(value)")
-        if let now = (answer["option"] as? [String: Any]).flatMap(GameOption.init) {
-            options[key] = now
+        let answer = await request("options-set \(key) \(value)")
+        if let error = answer.error { return error }
+        guard let now = (answer["option"] as? [String: Any]).flatMap(GameOption.init) else {
+            return "The launcher could not confirm that the setting was saved. Try again."
         }
-        return answer.error
+        options[key] = now
+        return nil
     }
 
     // MARK: What is shown
@@ -107,31 +139,44 @@ struct SettingsPage: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            if link.canList {
-                ForEach(GameOptions.groups, id: \.title) { group in
+            if model.loading && model.options.isEmpty {
+                ProgressView("Loading settings…").frame(maxWidth: .infinity).padding(24)
+            }
+            if let issue = model.issue {
+                VStack(alignment: .leading, spacing: 12) {
+                    Label("Settings couldn’t load", systemImage: "exclamationmark.triangle")
+                        .font(.headline)
+                    Text(issue).font(.subheadline).foregroundStyle(.secondary)
+                    Button("Try Again") { Task { await model.load() } }
+                        .accessibilityIdentifier("settings-retry")
+                }.padding(18).card()
+            }
+            if !model.unavailable.isEmpty {
+                Label("Some controls are unavailable in this build: " + model.unavailable.joined(separator: ", "),
+                      systemImage: "info.circle")
+                    .font(.footnote).foregroundStyle(.secondary)
+            }
+            ForEach(GameOptions.groups, id: \.title) { group in
+                let rows = group.rows.filter { model.options[$0.key] != nil }
+                if !rows.isEmpty {
                     SectionHeader(title: group.title) {
                         Image(systemName: group.icon).foregroundStyle(Theme.textFaint)
                     }
                     VStack(spacing: 0) {
-                        ForEach(group.rows, id: \.key) { row in
+                        ForEach(rows, id: \.key) { row in
                             if let option = model.options[row.key] {
                                 OptionRow(row: row, option: option) { value in
                                     Task {
-                                        if let error = await model.set(row.key, value) {
-                                            link.problem = error
-                                        }
+                                        if let error = await model.set(row.key, value) { link.problem = error }
                                     }
                                 }
-                                if row.key != group.rows.last?.key {
-                                    Divider().overlay(Theme.border).padding(.leading, 14)
-                                }
+                                if row.key != rows.last?.key { Divider().padding(.leading, 14) }
                             }
                         }
                     }
                     .card()
+                    .disabled(model.loading || model.issue != nil)
                 }
-            } else {
-                EmptyNote(icon: "hourglass", text: "The game's settings show here in a moment.")
             }
 
             SectionHeader(title: "Game files")
@@ -141,11 +186,7 @@ struct SettingsPage: View {
             SecondaryButton(title: "What's New", icon: "sparkles") { showingNews = true }
             About(version: link.version)
         }
-        .task(id: link.canList) {
-            if link.canList {
-                await model.load()
-            }
-        }
+        .task { await model.load() }
         .sheet(isPresented: $showingNews) {
             ScrollView {
                 NewsPage().pageColumn()
@@ -182,6 +223,7 @@ private struct OptionRow: View {
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
         .frame(minHeight: 50)
+        .accessibilityIdentifier("setting-" + row.key)
     }
 
     private var title: some View {
