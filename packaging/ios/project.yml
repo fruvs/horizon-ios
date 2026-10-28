@@ -147,15 +147,13 @@ targets:
   # The launcher, in SwiftUI, as a framework the game's bundle embeds: one .ipa. The game owns the process
   # (winit runs UIKit's main loop), so the launcher cannot run first; horizon-ios-launcher dlopens this
   # framework once the game's window is up and calls its horizon_launcher_present, which covers the game until
-  # Play. Its fonts are the theme crate's own, copied in as resources rather than checked in twice.
+  # Play. The launcher uses system fonts and native SwiftUI controls.
   HorizonLauncherKit:
     type: framework
     platform: iOS
     productName: HorizonLauncherKit
     sources:
       - path: Launcher
-      - path: ../../crates/horizon-theme/fonts
-        buildPhase: resources
     settings:
       base:
         GENERATE_INFOPLIST_FILE: YES

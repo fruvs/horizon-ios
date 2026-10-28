@@ -150,7 +150,7 @@ private struct ShotViewer: View {
                 dismiss()
             }
         }
-        .preferredColorScheme(.dark)
+
     }
 }
 

@@ -34,195 +34,238 @@ struct WorldIcon: View {
     }
 }
 
-/// Every saved world: tap to play, hold for Rename, Back Up and Delete; New makes one.
+/// A native library with the same file operations as Select World, plus search/sort/view controls.
 struct WorldsSection: View {
     @ObservedObject var link: GameLink
-    @State private var creating = false
+    @State private var query = ""
+    @State private var sort = WorldSort.recent
+    @State private var grid = true
+    let newWorld: () -> Void
     @State private var renaming: World?
     @State private var newName = ""
     @State private var deleting: World?
     @State private var backedUp: String?
 
-    var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            SectionHeader(title: "Worlds") {
-                Button {
-                    Haptics.tap()
-                    creating = true
-                } label: {
-                    Label("New", systemImage: "plus").font(Theme.sans(13, .semiBold))
-                        .foregroundStyle(Theme.accentText)
-                        .frame(minHeight: 44)
-                }
-                .disabled(!link.canList)
+    enum WorldSort: String, CaseIterable {
+        case recent = "Last played", name = "Name", mode = "Game mode"
+    }
+    private var worlds: [World] {
+        link.worlds.filter { query.isEmpty || $0.name.localizedCaseInsensitiveContains(query) }.sorted {
+            switch sort {
+            case .recent: return $0.lastPlayed > $1.lastPlayed
+            case .name: return $0.name.localizedStandardCompare($1.name) == .orderedAscending
+            case .mode: return $0.mode == $1.mode ? $0.name < $1.name : $0.mode < $1.mode
             }
-            if !link.canList, link.worlds.isEmpty {
-                EmptyNote(icon: "hourglass", text: "Your worlds show here once the game has loaded.")
-            } else if link.worlds.isEmpty {
-                EmptyNote(icon: "map", text: "No worlds yet. Make one with New, or bring one in as a .zip.")
+        }
+    }
+    var body: some View {
+        VStack(alignment: .leading, spacing: 24) {
+            HStack {
+                Text("\(worlds.count) \(worlds.count == 1 ? "world" : "worlds")")
+                    .font(.subheadline).foregroundStyle(.secondary)
+                Spacer()
+                Menu {
+                    Picker("Sort by", selection: $sort) {
+                        ForEach(WorldSort.allCases, id: \.self) { Text($0.rawValue).tag($0) }
+                    }
+                    Toggle("Grid view", isOn: $grid)
+                } label: { Image(systemName: "line.3.horizontal.decrease").frame(minWidth: 44, minHeight: 44) }
+                    .accessibilityLabel("World view options")
+                Button(action: newWorld) { Label("New World", systemImage: "plus") }
+                    .controlSize(.large).launcherPrimaryButton().disabled(!link.canList)
+                    .accessibilityIdentifier("new-world-button")
+            }
+            if !link.canList && link.worlds.isEmpty {
+                ProgressView("Loading worlds…").frame(maxWidth: .infinity).padding(40)
+            } else if worlds.isEmpty {
+                VStack(spacing: 16) {
+                    Image(systemName: "globe.europe.africa").font(.system(size: 48, weight: .ultraLight))
+                    Text(query.isEmpty ? "Your next adventure starts here" : "No matching worlds").font(.title3.bold())
+                    if query.isEmpty { Text("Create a world with the settings you want.").foregroundStyle(.secondary) }
+                }.frame(maxWidth: .infinity).padding(.vertical, 64)
+            } else if grid {
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 260, maximum: 420), spacing: 22)], spacing: 24) {
+                    ForEach(worlds) { world in worldCard(world) }
+                }
             } else {
                 VStack(spacing: 0) {
-                    ForEach(link.worlds) { world in
-                        WorldRow(world: world) {
-                            Task { await link.play(world) }
-                        }
-                        .contextMenu {
-                            Button {
-                                Task { await link.play(world) }
-                            } label: { Label("Play", systemImage: "play.fill") }
-                            Button {
-                                newName = world.name
-                                renaming = world
-                            } label: { Label("Rename", systemImage: "pencil") }
-                            Button {
-                                Task {
-                                    if let bytes = await link.backup(world) {
-                                        let size = ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file)
-                                        backedUp = "\(world.name) was saved to the backups folder (\(size))."
-                                        Haptics.done()
+                    ForEach(worlds) { world in
+                        HStack(spacing: 14) {
+                            Button { Task { await link.play(world) } } label: {
+                                HStack(spacing: 14) {
+                                    WorldIcon(world: world, size: 58)
+                                    VStack(alignment: .leading, spacing: 5) {
+                                        Text(world.name).font(.headline).foregroundStyle(.primary)
+                                        Text(world.subtitle).font(.caption).foregroundStyle(.secondary)
                                     }
-                                }
-                            } label: { Label("Back Up", systemImage: "externaldrive.badge.plus") }
-                            Button(role: .destructive) {
-                                deleting = world
-                            } label: { Label("Delete", systemImage: "trash") }
-                        }
-                        if world != link.worlds.last {
-                            Divider().overlay(Theme.border).padding(.leading, 70)
-                        }
+                                    Spacer()
+                                }.contentShape(Rectangle())
+                            }.buttonStyle(.plain).disabled(link.launching != nil)
+                            Menu { actions(world) } label: { Image(systemName: "ellipsis").frame(width: 44, height: 44) }
+                                .accessibilityLabel("Options for \(world.name)")
+                        }.padding(16)
+                        if world.id != worlds.last?.id { Divider().padding(.leading, 88) }
                     }
-                }
-                .card()
-                Text("Hold a world to rename, back up or delete it.")
-                    .font(Theme.sans(11)).foregroundStyle(Theme.textFaint)
+                }.card(radius: 22)
             }
         }
-        .sheet(isPresented: $creating) {
-            NewWorldSheet { name, seed, creative in
-                creating = false
-                Task { await link.create(name: name, seed: seed, creative: creative) }
-            }
-        }
+        .searchable(text: $query, prompt: "Search worlds")
         .alert("Rename world", isPresented: Binding(get: { renaming != nil }, set: { if !$0 { renaming = nil } })) {
             TextField("World name", text: $newName)
-            Button("Rename") {
-                if let world = renaming {
-                    Task { await link.rename(world, to: newName) }
-                }
-            }
+            Button("Rename") { if let world = renaming { Task { await link.rename(world, to: newName) } } }
             Button("Cancel", role: .cancel) {}
         }
-        .confirmationDialog(
-            "Delete \(deleting?.name ?? "this world")?",
-            isPresented: Binding(get: { deleting != nil }, set: { if !$0 { deleting = nil } }),
-            titleVisibility: .visible
-        ) {
-            Button("Delete for good", role: .destructive) {
-                if let world = deleting {
-                    Task { await link.delete(world) }
-                }
-            }
-        } message: {
-            Text("It will be lost forever (a long time!). Back it up first if you might want it again.")
-        }
-        .alert("Backed up", isPresented: Binding(get: { backedUp != nil }, set: { if !$0 { backedUp = nil } })) {
+        .confirmationDialog("Delete \(deleting?.name ?? "this world")?",
+            isPresented: Binding(get: { deleting != nil }, set: { if !$0 { deleting = nil } }), titleVisibility: .visible) {
+            Button("Delete World", role: .destructive) { if let world = deleting { Task { await link.delete(world) } } }
+        } message: { Text("This permanently removes the world. Make a backup first if you want to keep it.") }
+        .alert("Backup saved", isPresented: Binding(get: { backedUp != nil }, set: { if !$0 { backedUp = nil } })) {
             Button("OK", role: .cancel) {}
-        } message: {
-            Text(backedUp ?? "")
-        }
+        } message: { Text(backedUp ?? "") }
     }
-}
 
-private struct WorldRow: View {
-    let world: World
-    let play: () -> Void
-
-    var body: some View {
-        Button(action: play) {
-            HStack(spacing: 12) {
-                WorldIcon(world: world, size: 46)
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(world.name).font(Theme.sans(15, .semiBold)).foregroundStyle(Theme.text).lineLimit(1)
-                    Text(world.subtitle).font(Theme.sans(11)).foregroundStyle(Theme.textMuted).lineLimit(1)
+    private func worldCard(_ world: World) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Button { Task { await link.play(world) } } label: {
+                ZStack(alignment: .bottomTrailing) {
+                    LauncherLandscape(world: world)
+                    LinearGradient(colors: [.clear, .black.opacity(0.30)], startPoint: .center, endPoint: .bottom)
+                    Image(systemName: "play.circle.fill").font(.system(size: 36)).foregroundStyle(.white).padding(16)
+                }.frame(height: 180).clipped().contentShape(Rectangle())
+            }.buttonStyle(.plain).disabled(link.launching != nil).accessibilityLabel("Play \(world.name)")
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(alignment: .top) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(world.name).font(.headline).lineLimit(2)
+                        Text(world.lastPlayed, style: .relative).font(.caption).foregroundStyle(.secondary)
+                    }
+                    Spacer(minLength: 0)
+                    Menu { actions(world) } label: { Image(systemName: "ellipsis").frame(width: 40, height: 44) }
+                        .accessibilityLabel("Options for \(world.name)")
                 }
-                Spacer(minLength: 0)
-                if world.mode == "creative" {
-                    Image(systemName: "cube.fill").foregroundStyle(Theme.accentText).font(.system(size: 13))
-                }
-                Image(systemName: "chevron.right").foregroundStyle(Theme.textFaint).font(.system(size: 12, weight: .semibold))
-            }
-            .padding(12)
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(PressStyle())
-    }
-}
-
-/// Create New World, in short: a name, a game mode and an optional seed.
-private struct NewWorldSheet: View {
-    let create: (String, String, Bool) -> Void
-    @State private var name = "New World"
-    @State private var seed = ""
-    @State private var creative = false
-    @Environment(\.dismiss) private var dismiss
-
-    var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 18) {
-                HStack {
-                    Text("Create New World").font(Theme.pixel(24)).foregroundStyle(Theme.text)
+                HStack(spacing: 8) {
+                    Label(world.mode.capitalized, systemImage: world.mode == "creative" ? "cube" : "leaf")
                     Spacer()
-                    Button("Cancel") { dismiss() }.font(Theme.sans(14)).foregroundStyle(Theme.textMuted)
+                    Text(world.version)
+                }.font(.caption).foregroundStyle(.secondary)
+            }.padding(16)
+        }
+        .background(Theme.surface).clipShape(RoundedRectangle(cornerRadius: 22))
+        .contextMenu { actions(world) }
+    }
+
+    @ViewBuilder private func actions(_ world: World) -> some View {
+        Button { Task { await link.play(world) } } label: { Label("Play", systemImage: "play.fill") }
+        Button { newName = world.name; renaming = world } label: { Label("Rename", systemImage: "pencil") }
+        Button {
+            Task {
+                if let bytes = await link.backup(world) {
+                    backedUp = "\(world.name) · \(ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file))"
+                    Haptics.done()
                 }
-                Field(title: "WORLD NAME", placeholder: "New World", text: $name, keyboard: .default)
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("GAME MODE").font(Theme.mono(9)).foregroundStyle(Theme.textMuted)
-                    HStack(spacing: 8) {
-                        ModeTile(title: "Survival", detail: "Gather, build, survive", icon: "heart.fill",
-                                 selected: !creative) { creative = false }
-                        ModeTile(title: "Creative", detail: "Every block, no limits", icon: "cube.fill",
-                                 selected: creative) { creative = true }
+            }
+        } label: { Label("Back Up", systemImage: "externaldrive.badge.plus") }
+        Button(role: .destructive) { deleting = world } label: { Label("Delete", systemImage: "trash") }
+    }
+}
+
+struct WorldCreationSettings: Codable {
+    var name = "New World"
+    var seed = ""
+    var mode = "survival"
+    var difficulty = "normal"
+    var commands = false
+    var flat = false
+    var structures = true
+    var bonus_chest = false
+}
+
+/// Every switch is backed by the game's CreateWorldScreen options, not a decorative preference.
+struct NewWorldSheet: View {
+    let create: (WorldCreationSettings) -> Void
+    @State private var settings = WorldCreationSettings()
+    @Environment(\.dismiss) private var dismiss
+    private var hardcore: Bool { settings.mode == "hardcore" }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    TextField("World name", text: $settings.name)
+                        .accessibilityIdentifier("creation-world-name")
+                    Picker("Game mode", selection: $settings.mode) {
+                        Label("Survival", systemImage: "leaf").tag("survival")
+                        Label("Creative", systemImage: "cube").tag("creative")
+                        Label("Hardcore", systemImage: "heart.slash").tag("hardcore")
+                    }
+                    .pickerStyle(.menu).accessibilityIdentifier("creation-mode")
+                    Picker("Difficulty", selection: $settings.difficulty) {
+                        ForEach(["peaceful", "easy", "normal", "hard"], id: \.self) { Text($0.capitalized).tag($0) }
+                    }.pickerStyle(.menu).disabled(hardcore).accessibilityIdentifier("creation-difficulty")
+                    Toggle("Allow Cheats", isOn: $settings.commands).disabled(hardcore).accessibilityIdentifier("creation-cheats")
+                } header: { Text("Game") } footer: {
+                    Text(hardcore ? "One life, locked to Hard difficulty. Cheats and the bonus chest are disabled." :
+                         settings.mode == "creative" ? "Unlimited blocks, flying and instant building." : "Gather resources, craft and explore.")
+                }
+                Section("World generation") {
+                    TextField("Seed (optional)", text: $settings.seed).textInputAutocapitalization(.never).autocorrectionDisabled()
+                    Picker("World type", selection: $settings.flat) {
+                        Text("Default").tag(false)
+                        Text("Superflat").tag(true)
+                    }
+                    Toggle("Generate Structures", isOn: $settings.structures)
+                    Toggle("Bonus Chest", isOn: $settings.bonus_chest).disabled(hardcore)
+                }
+            }
+            .navigationTitle("New World")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Create") { create(settings) }
+                        .disabled(settings.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        .accessibilityIdentifier("creation-confirm")
+                }
+            }
+            .onChange(of: settings.mode) { mode in
+                settings.commands = mode == "creative"
+                if mode == "hardcore" { settings.difficulty = "hard"; settings.bonus_chest = false }
+            }
+        }
+        .presentationDetents([.large])
+        .presentationDragIndicator(.visible)
+    }
+}
+
+/// Artwork is the user's world thumbnail or imported title panorama, never bundled game assets.
+struct LauncherLandscape: View {
+    var index: Int = 0
+    var world: World? = nil
+    @State private var panorama: UIImage?
+    var body: some View {
+        GeometryReader { geometry in
+            Group {
+                if let image = world?.icon ?? panorama {
+                    Image(uiImage: image).resizable().scaledToFill()
+                } else {
+                    // An original, quiet landscape while resources are not imported yet.
+                    ZStack {
+                        LinearGradient(colors: [Color(red: 0.18, green: 0.48, blue: 0.57),
+                                                Color(red: 0.55, green: 0.71, blue: 0.68)],
+                                       startPoint: .top, endPoint: .bottom)
+                        Image(systemName: "mountain.2.fill").resizable().scaledToFit()
+                            .foregroundStyle(.white.opacity(0.16)).padding(32).offset(y: 30)
                     }
                 }
-                Field(title: "SEED (OPTIONAL)", placeholder: "Leave blank for a random seed", text: $seed,
-                      keyboard: .asciiCapable)
-                Text("A seed is a number or a word without spaces; the same seed makes the same world.")
-                    .font(Theme.sans(11)).foregroundStyle(Theme.textFaint)
-                PrimaryButton(title: "Create World", icon: "sparkles") {
-                    create(name, seed, creative)
-                }
-            }
-            .padding(20)
+            }.frame(width: geometry.size.width, height: geometry.size.height).clipped()
         }
-        .background(Theme.background.ignoresSafeArea())
-        .presentationDetents([.medium, .large])
-        .preferredColorScheme(.dark)
-    }
-}
-
-private struct ModeTile: View {
-    let title: String
-    let detail: String
-    let icon: String
-    let selected: Bool
-    let pick: () -> Void
-
-    var body: some View {
-        Button {
-            Haptics.tap()
-            pick()
-        } label: {
-            VStack(alignment: .leading, spacing: 6) {
-                Image(systemName: icon).foregroundStyle(selected ? Theme.accentText : Theme.textFaint)
-                Text(title).font(Theme.pixel(17)).foregroundStyle(Theme.text)
-                Text(detail).font(Theme.sans(11)).foregroundStyle(Theme.textMuted)
+        .accessibilityHidden(true)
+        .allowsHitTesting(false)
+        .task {
+            let url = GameFolder.resources.appendingPathComponent("assets/minecraft/textures/gui/title/background/panorama_\(index % 4).png")
+            if let image = UIImage(contentsOfFile: url.path), image.size.width > 16, image.size.height > 16 {
+                panorama = image
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(12)
-            .background(selected ? Theme.notice : Theme.surfaceSunken, in: RoundedRectangle(cornerRadius: 10))
-            .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(selected ? Theme.accent : Theme.border,
-                                                                     lineWidth: selected ? 2 : 1))
         }
-        .buttonStyle(PressStyle())
     }
 }

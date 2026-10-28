@@ -167,20 +167,12 @@ final class GameLink: ObservableObject {
         await go("Opening \(world.name)") { await Bridge.world("open", folder: world.folder) }
     }
 
-    func create(name: String, seed: String, creative: Bool) async {
+    func create(_ settings: WorldCreationSettings) async {
         Haptics.launch()
-        var line = "world-create"
-        let seed = seed.trimmingCharacters(in: .whitespaces)
-        if !seed.isEmpty, !seed.contains(where: \.isWhitespace) {
-            line += " --seed \(seed)"
+        guard let data = try? JSONEncoder().encode(settings), let json = String(data: data, encoding: .utf8) else {
+            problem = "Could not prepare world settings."; return
         }
-        if creative {
-            line += " --creative"
-        }
-        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        let name = trimmed.isEmpty ? "New World" : trimmed
-        line += " \(name)"
-        await go("Creating \(name)") { await Bridge.send(line) }
+        await go("Creating \(settings.name)") { await Bridge.send("world-create \(json)") }
     }
 
     func join(_ address: String) async {

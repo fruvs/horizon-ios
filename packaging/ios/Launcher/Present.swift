@@ -40,7 +40,7 @@ private func present(attempts: Int) {
                 Task { _ = await Bridge.send("launcher-visible false") }
             }
         })
-        .preferredColorScheme(.dark)
+
     )
     host.modalPresentationStyle = .fullScreen
     host.modalTransitionStyle = .crossDissolve
@@ -66,6 +66,7 @@ func turn(_ scene: UIWindowScene?, to orientations: UIInterfaceOrientationMask) 
 /// The view controller of winit's window: the one the launcher is presented from.
 func gameViewController() -> UIViewController? {
     let windows = UIApplication.shared.connectedScenes
+        .filter { $0.session.role == .windowApplication }
         .compactMap { $0 as? UIWindowScene }
         .flatMap(\.windows)
     let window = windows.first(where: \.isKeyWindow) ?? windows.first
@@ -85,8 +86,9 @@ private final class LauncherHostingController: UIHostingController<AnyView> {
     override var preferredInterfaceOrientationForPresentation: UIInterfaceOrientation {
         guard UIDevice.current.userInterfaceIdiom == .pad else { return .portrait }
         return UIApplication.shared.connectedScenes
-            .compactMap { $0 as? UIWindowScene }
+            .filter { $0.session.role == .windowApplication }
+        .compactMap { $0 as? UIWindowScene }
             .first(where: { $0.activationState == .foregroundActive })?.interfaceOrientation ?? .portrait
     }
-    override var preferredStatusBarStyle: UIStatusBarStyle { .lightContent }
+    override var preferredStatusBarStyle: UIStatusBarStyle { .default }
 }

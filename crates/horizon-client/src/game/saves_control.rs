@@ -22,6 +22,61 @@ pub(super) const HELP: &[&str] = &[
     "server-ping ADDRESS            a server's status: motd, players, version, latency and icon",
 ];
 
+/// Native world creation uses the same options as CreateWorldScreen, encoded as JSON so names and seeds
+/// keep spaces. The existing command-line spelling remains supported.
+#[derive(serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct NativeWorldCreation {
+    name: String,
+    seed: String,
+    mode: String,
+    difficulty: String,
+    commands: bool,
+    flat: bool,
+    structures: bool,
+    bonus_chest: bool,
+}
+impl Default for NativeWorldCreation {
+    fn default() -> Self {
+        Self {
+            name: "New World".into(),
+            seed: String::new(),
+            mode: "survival".into(),
+            difficulty: "normal".into(),
+            commands: false,
+            flat: false,
+            structures: true,
+            bonus_chest: false,
+        }
+    }
+}
+impl NativeWorldCreation {
+    fn options(&self) -> Result<(bool, title::WorldOptions)> {
+        let (creative, hardcore) = match self.mode.as_str() {
+            "survival" => (false, false),
+            "creative" => (true, false),
+            "hardcore" => (false, true),
+            _ => return Err("unknown game mode".into()),
+        };
+        let difficulty = ["peaceful", "easy", "normal", "hard"]
+            .iter()
+            .position(|&v| v == self.difficulty)
+            .ok_or("unknown difficulty")?;
+        Ok((
+            creative,
+            title::WorldOptions {
+                hardcore,
+                difficulty: if hardcore { 3 } else { difficulty },
+                commands: Some(!hardcore && self.commands),
+                flat: self.flat,
+                structures: self.structures,
+                bonus_chest: !hardcore && self.bonus_chest,
+                ..Default::default()
+            },
+        ))
+    }
+}
+
 fn saves() -> Result<PathBuf> {
     Ok(std::env::current_dir()?.join("saves"))
 }
@@ -199,9 +254,31 @@ impl Game<'_> {
             }
             "world-create" => {
                 on_title()?;
+                let rest = line
+                    .trim_start()
+                    .strip_prefix("world-create")
+                    .unwrap_or("")
+                    .trim_start();
+                if rest.starts_with('{') {
+                    let settings: NativeWorldCreation = serde_json::from_str(rest)?;
+                    let (creative, options) = settings.options()?;
+                    let name = settings.name.trim();
+                    let name = if name.is_empty() { "New World" } else { name };
+                    let folder = title::new_world_folder(&saves()?, name);
+                    self.open_world(
+                        &folder,
+                        Some(name),
+                        title::parse_seed(&settings.seed),
+                        creative,
+                        Some(&options),
+                    )?;
+                    return Ok(Some(Some(
+                        json!({ "ok": true, "folder": folder, "name": name }),
+                    )));
+                }
                 let mut seed = None;
                 let mut creative = false;
-                let mut rest = line.trim_start().strip_prefix("world-create").unwrap_or("");
+                let mut rest = rest;
                 loop {
                     rest = rest.trim_start();
                     if let Some(after) = rest.strip_prefix("--creative") {
@@ -225,5 +302,56 @@ impl Game<'_> {
             _ => return Ok(None),
         };
         Ok(Some(Some(value)))
+    }
+}
+
+#[cfg(test)]
+mod native_creation_tests {
+    use super::*;
+    #[test]
+    fn native_creation_carries_all_generation_choices() {
+        let v: NativeWorldCreation = serde_json::from_str(r#"{"name":"A world with spaces","seed":"hello world","mode":"creative","difficulty":"easy","commands":true,"flat":true,"structures":false,"bonus_chest":true}"#).unwrap();
+        let (creative, o) = v.options().unwrap();
+        assert!(creative && o.commands == Some(true) && o.flat && o.bonus_chest);
+        assert!(!o.structures && !o.hardcore);
+        assert_eq!(o.difficulty, 1);
+        assert_eq!(v.name, "A world with spaces");
+        assert_eq!(title::parse_seed(&v.seed), title::parse_seed("hello world"));
+    }
+    #[test]
+    fn native_hardcore_locks_hard_difficulty_and_disables_cheats_and_bonus_chest() {
+        let v = NativeWorldCreation {
+            mode: "hardcore".into(),
+            difficulty: "peaceful".into(),
+            commands: true,
+            bonus_chest: true,
+            ..Default::default()
+        };
+        let (creative, o) = v.options().unwrap();
+        assert!(!creative && o.hardcore && o.commands == Some(false) && !o.bonus_chest);
+        assert_eq!(o.difficulty, 3);
+    }
+    #[test]
+    fn native_creation_rejects_unknown_choices_and_keeps_safe_defaults() {
+        assert!(
+            NativeWorldCreation {
+                mode: "spectator".into(),
+                ..Default::default()
+            }
+            .options()
+            .is_err()
+        );
+        assert!(
+            NativeWorldCreation {
+                difficulty: "oops".into(),
+                ..Default::default()
+            }
+            .options()
+            .is_err()
+        );
+        let (_, o) = NativeWorldCreation::default().options().unwrap();
+        assert!(o.structures && !o.flat && !o.hardcore);
+        assert_eq!(o.difficulty, 2);
+        assert!(serde_json::from_str::<NativeWorldCreation>(r#"{"unsupported":true}"#).is_err());
     }
 }

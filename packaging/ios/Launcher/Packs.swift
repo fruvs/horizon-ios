@@ -218,7 +218,6 @@ struct PacksPage: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            PageTitle(title: "Packs", subtitle: "Resource packs and shader packs from Modrinth.")
             Picker("Kind", selection: $kind) {
                 ForEach(PackKind.allCases) { Text($0.title).tag($0) }
             }

@@ -12,8 +12,6 @@ struct ServersPage: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            PageTitle(title: "Servers", subtitle: "Play with others on Java Edition 26.3 servers.")
-            AccountCard(account: account)
             VStack(alignment: .leading, spacing: 10) {
                 Field(title: "DIRECT CONNECTION", placeholder: "play.example.com or 192.168.1.20:25565",
                       text: $direct)
@@ -108,14 +106,15 @@ private struct ServerRow: View {
                 icon
                 VStack(alignment: .leading, spacing: 3) {
                     HStack {
-                        Text(server.name).font(Theme.sans(15, .semiBold)).foregroundStyle(Theme.text).lineLimit(1)
+                        MinecraftFormatting.text(server.name, defaultColor: Theme.text).font(.headline).lineLimit(1)
                         Spacer(minLength: 4)
                         signal
                     }
-                    Text(detail).font(Theme.sans(11)).foregroundStyle(detailColor).lineLimit(2)
+                    MinecraftFormatting.text(detail, defaultColor: detailColor).font(.subheadline).lineLimit(3)
+                        .accessibilityLabel(MinecraftFormatting.plain(detail))
                         .multilineTextAlignment(.leading)
                     if let status, status.failed == nil {
-                        Text("\(status.online)/\(status.max) players · \(status.version)")
+                        MinecraftFormatting.text("\(status.online)/\(status.max) players · \(status.version)", defaultColor: Theme.textFaint)
                             .font(Theme.mono(9)).foregroundStyle(Theme.textFaint).lineLimit(1)
                     }
                 }
@@ -221,6 +220,6 @@ private struct AddServerSheet: View {
         }
         .background(Theme.background.ignoresSafeArea())
         .presentationDetents([.medium])
-        .preferredColorScheme(.dark)
+
     }
 }

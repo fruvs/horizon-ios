@@ -107,7 +107,6 @@ struct SettingsPage: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            PageTitle(title: "Settings", subtitle: "Saved to the game's options.txt, and applied at once while it runs.")
             if link.canList {
                 ForEach(GameOptions.groups, id: \.title) { group in
                     SectionHeader(title: group.title) {
@@ -153,7 +152,7 @@ struct SettingsPage: View {
             }
             .background(Theme.background.ignoresSafeArea())
             .presentationDetents([.large])
-            .preferredColorScheme(.dark)
+
         }
     }
 }

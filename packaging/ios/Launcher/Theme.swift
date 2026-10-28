@@ -1,83 +1,79 @@
-import CoreText
 import SwiftUI
+import UIKit
 
-// The phone's launcher: the home screen from the Figma design (UI, node 40:168), drawn with Horizon's own
-// fonts from crates/horizon-theme/fonts. It is a framework the game's bundle embeds, not an app: the game owns
-// the process, and shows this over itself through Present.swift. Play uncovers the game; everything else asks
-// the game through Bridge.swift.
-
-/// The framework's own bundle: its images and fonts are there, not in the app's.
 final class Kit {
     static let bundle = Bundle(for: Kit.self)
-
-    static func image(_ name: String) -> Image {
-        Image(name, bundle: bundle)
-    }
+    static func image(_ name: String) -> Image { Image(name, bundle: bundle) }
 }
 
-/// The design's colours and type, named once so the views read as the design does.
+/// Semantic UIKit colors adapt to appearance, contrast and accessibility settings.
+/// Legacy type helper names remain so all launcher pages share the native typography.
 enum Theme {
-    static let background = Color(hex: 0x0C0B12)
-    static let surface = Color(hex: 0x191624)
-    static let surfaceSunken = Color(hex: 0x100D1A)
-    static let surfaceDisabled = Color(hex: 0x221D32)
-    static let border = Color(hex: 0x302A42)
-    static let accent = Color(hex: 0x7645F5)
-    static let accentEdge = Color(hex: 0xA68BFF)
-    static let accentBright = Color(hex: 0x8960FF)
-    static let accentText = Color(hex: 0xC2AAFF)
-    static let notice = Color(hex: 0x2E2149)
-    static let noticeBorder = Color(hex: 0x483460)
-    static let ready = Color(hex: 0x5BD7A0)
-    static let warn = Color(hex: 0xF2C14E)
-    static let danger = Color(hex: 0xF06A6A)
-    /// The title screen's splash yellow and its drop shadow, a quarter of it (`SplashRenderer`, title.rs).
-    static let splash = Color(hex: 0xFFFF00)
-    static let splashShadow = Color(hex: 0x3F3F00)
-    static let text = Color(hex: 0xF5F1FF)
-    static let textMuted = Color(hex: 0xA9A1BC)
-    static let textFaint = Color(hex: 0x777085)
+    static let background = Color(uiColor: .systemGroupedBackground)
+    static let surface = Color(uiColor: .secondarySystemGroupedBackground)
+    static let surfaceSunken = Color(uiColor: .tertiarySystemGroupedBackground)
+    static let surfaceDisabled = Color(uiColor: .tertiarySystemFill)
+    static let border = Color(uiColor: .separator).opacity(0.28)
+    static let accent = Color.blue
+    static let accentEdge = Color.blue
+    static let accentBright = Color.blue
+    static let accentText = Color.blue
+    static let notice = Color.blue.opacity(0.10)
+    static let noticeBorder = Color.blue.opacity(0.18)
+    static let ready = Color.green
+    static let warn = Color.orange
+    static let danger = Color.red
+    static let splash = Color.yellow
+    static let splashShadow = Color.black.opacity(0.3)
+    static let text = Color.primary
+    static let textMuted = Color.secondary
+    static let textFaint = Color(uiColor: .secondaryLabel)
 
-    // The design names Inter and Roboto Mono; Horizon's launcher speaks Geist and Geist Mono, which ship in
-    // the repository, so the phone matches the desktop rather than a font the app would have to bundle anew.
+    enum PixelWeight { case medium, semiBold, bold }
+    enum SansWeight { case regular, medium, semiBold }
     static func pixel(_ size: CGFloat, _ weight: PixelWeight = .semiBold) -> Font {
-        .custom(weight.rawValue, fixedSize: size)
+        native(size).weight(weight == .bold ? .bold : weight == .medium ? .medium : .semibold)
     }
     static func sans(_ size: CGFloat, _ weight: SansWeight = .regular) -> Font {
-        .custom(weight.rawValue, fixedSize: size)
+        native(size).weight(weight == .semiBold ? .semibold : weight == .medium ? .medium : .regular)
     }
-    static func mono(_ size: CGFloat) -> Font {
-        .custom("GeistMono-Regular", fixedSize: size)
-    }
-
-    enum PixelWeight: String {
-        case medium = "PixelifySans-Medium"
-        case semiBold = "PixelifySans-SemiBold"
-        case bold = "PixelifySans-Bold"
-    }
-    enum SansWeight: String {
-        case regular = "Geist-Regular"
-        case medium = "Geist-Medium"
-        case semiBold = "Geist-SemiBold"
-    }
-
-    /// The fonts are bundle resources and not `UIAppFonts` entries, so the generated Info.plist needs no list
-    /// that could drift from the folder.
-    static func registerFonts() {
-        for url in Kit.bundle.urls(forResourcesWithExtension: "ttf", subdirectory: nil) ?? [] {
-            CTFontManagerRegisterFontsForURL(url as CFURL, .process, nil)
+    static func mono(_ size: CGFloat) -> Font { native(size).monospaced() }
+    private static func native(_ size: CGFloat) -> Font {
+        switch size {
+        case 28...: return .largeTitle
+        case 22..<28: return .title2
+        case 18..<22: return .title3
+        case 16..<18: return .body
+        case 14..<16: return .callout
+        case 12..<14: return .footnote
+        default: return .caption
         }
     }
+    static func registerFonts() { /* Uses system fonts; no font registration needed. */ }
 }
 
 extension Color {
     init(hex: UInt32, opacity: Double = 1) {
-        self.init(
-            .sRGB,
-            red: Double((hex >> 16) & 0xFF) / 255,
-            green: Double((hex >> 8) & 0xFF) / 255,
-            blue: Double(hex & 0xFF) / 255,
-            opacity: opacity
-        )
+        self.init(.sRGB, red: Double((hex >> 16) & 255) / 255,
+                  green: Double((hex >> 8) & 255) / 255, blue: Double(hex & 255) / 255, opacity: opacity)
+    }
+}
+
+extension View {
+    /// Native Liquid Glass for controls on iOS 26+, system materials on older supported releases.
+    @ViewBuilder func launcherGlass() -> some View {
+        if #available(iOS 26.0, *) {
+            self.glassEffect(.regular, in: .rect(cornerRadius: 24))
+        } else {
+            self.background(.regularMaterial, in: RoundedRectangle(cornerRadius: 24))
+        }
+    }
+    @ViewBuilder func launcherPrimaryButton() -> some View {
+        if #available(iOS 26.0, *) { self.buttonStyle(.glassProminent) }
+        else { self.buttonStyle(.borderedProminent) }
+    }
+    @ViewBuilder func launcherSecondaryButton() -> some View {
+        if #available(iOS 26.0, *) { self.buttonStyle(.glass) }
+        else { self.buttonStyle(.bordered) }
     }
 }

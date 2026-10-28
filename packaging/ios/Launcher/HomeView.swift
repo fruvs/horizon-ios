@@ -1,189 +1,101 @@
 import SwiftUI
 import UIKit
 
-/// The adaptive phone and iPad launcher: Play, Servers, Packs, Gallery and Settings
-/// (What's New is in Settings). Everything it knows about the game it asks the game under it (GameLink.swift,
-/// Bridge.swift).
+/// Native launcher shared by iPhone and iPad. The game/session bridge is unchanged.
 struct HomeView: View {
-    /// Play: uncover the game (Present.swift).
     var onPlay: () -> Void
     @StateObject private var link = GameLink()
-    @StateObject private var device = DeviceStatus()
     @StateObject private var download = GameFilesDownload()
     @StateObject private var player = PlayerName()
     @StateObject private var head = SkinHead()
     @StateObject private var account = MicrosoftAccount()
+    @Environment(\.horizontalSizeClass) private var sizeClass
+    @State private var tab = Destination.play
+    private enum Sheet: String, Identifiable { case account, newWorld; var id: String { rawValue } }
+    @State private var sheet: Sheet?
     @State private var editingName = false
     @State private var nameDraft = ""
     @State private var nameRejected = false
-    @State private var tab = Tab.play
-    @Environment(\.dynamicTypeSize) private var typeSize
 
-    enum Tab: String, CaseIterable {
-        case play, servers, packs, gallery, settings
-
+    enum Destination: String, CaseIterable, Identifiable {
+        case play, worlds, servers, packs, settings
+        var id: Self { self }
         var title: String { rawValue.capitalized }
         var icon: String {
             switch self {
-            case .play: return "play.fill"
-            case .servers: return "globe"
-            case .packs: return "square.stack.3d.up.fill"
-            case .gallery: return "photo.on.rectangle"
-            case .settings: return "slider.horizontal.3"
+            case .play: return "play.circle"
+            case .worlds: return "square.grid.2x2"
+            case .servers: return "network"
+            case .packs: return "shippingbox"
+            case .settings: return "gearshape"
             }
         }
     }
 
-    // Spelled out: a private property makes the memberwise one private, and Present.swift builds this view.
-    init(onPlay: @escaping () -> Void = {}) {
-        self.onPlay = onPlay
-        // The bar under the pages, in the launcher's colours rather than the system's grey.
-        let bar = UITabBarAppearance()
-        bar.configureWithOpaqueBackground()
-        bar.backgroundColor = UIColor(Theme.background)
-        bar.shadowColor = UIColor(Theme.border)
-        UITabBar.appearance().standardAppearance = bar
-        UITabBar.appearance().scrollEdgeAppearance = bar
-    }
+    init(onPlay: @escaping () -> Void = {}) { self.onPlay = onPlay }
 
     var body: some View {
-        GeometryReader { geometry in
-            Group {
-                if geometry.size.width >= 1000 && !typeSize.isAccessibilitySize {
-                    HStack(spacing: 0) {
-                        navigationRail.frame(width: 208)
-                            .accessibilityIdentifier("launcher-navigation-rail")
-                        Rectangle().fill(Theme.border).frame(width: 1)
-                        content(for: tab)
+        Group {
+            if sizeClass == .regular {
+                NavigationSplitView {
+                    List(Destination.allCases, selection: Binding<Destination?>(
+                        get: { tab }, set: { if let value = $0 { tab = value } }
+                    )) { item in
+                        Label(item.title, systemImage: item.icon).tag(item)
                     }
-                } else {
-                    TabView(selection: $tab) {
-                        ForEach(Tab.allCases, id: \.self) { item in
-                            content(for: item)
-                                .tabItem { Label(item.title, systemImage: item.icon) }
-                                .tag(item)
-                        }
+                    .navigationTitle("Horizon")
+                    .navigationSplitViewColumnWidth(min: 210, ideal: 240, max: 280)
+                    .accessibilityIdentifier("launcher-navigation-rail")
+                } detail: {
+                    NavigationStack { destination(tab) }
+                }
+                .navigationSplitViewStyle(.balanced)
+            } else {
+                TabView(selection: $tab) {
+                    ForEach(Destination.allCases) { item in
+                        NavigationStack { destination(item) }
+                            .tabItem { Label(item.title, systemImage: item.icon) }
+                            .tag(item)
                     }
                 }
             }
-            .safeAreaInset(edge: .top, spacing: 0) {
-                Header(name: shownName, face: head.face, canEditName: account.profile == nil, editName: editName)
-                    .frame(maxWidth: .infinity)
-                    .background(Theme.background)
-            }
-            .background(Theme.background.ignoresSafeArea())
         }
-        .tint(Theme.accentText)
-        .onChange(of: tab) { _ in Haptics.tap() }
-        // The offline name the game plays with.
-        .alert("Player name", isPresented: $editingName) {
-            TextField("Name", text: $nameDraft)
-                .textInputAutocapitalization(.never)
-                .autocorrectionDisabled()
+        .tint(.blue)
+        .sheet(item: Binding<Sheet?>(
+            get: { sizeClass == .regular || sheet == .account ? sheet : nil },
+            set: { sheet = $0 }
+        )) { item in
+            switch item {
+            case .account: accountSheet
+            case .newWorld: newWorldSheet
+            }
+        }
+        .fullScreenCover(isPresented: Binding(
+            get: { sizeClass != .regular && sheet == .newWorld },
+            set: { if !$0 { sheet = nil } }
+        )) { newWorldSheet }
+        .alert("Offline player name", isPresented: $editingName) {
+            TextField("Name", text: $nameDraft).textInputAutocapitalization(.never).autocorrectionDisabled()
             Button("Save") {
                 guard account.profile == nil else { return }
                 nameRejected = !player.save(nameDraft.trimmingCharacters(in: .whitespaces))
             }
             Button("Cancel", role: .cancel) {}
-        } message: {
-            Text("Your name in single player and on servers that don't check accounts. Up to 16 characters, no spaces.")
-        }
-        .alert("That name can't be used", isPresented: $nameRejected) {
+        } message: { Text("Up to 16 characters, with no spaces.") }
+        .alert("That name can’t be used", isPresented: $nameRejected) {
             Button("OK", role: .cancel) {}
-        } message: {
-            Text("Use 1 to 16 letters, digits or symbols, with no spaces.")
-        }
+        } message: { Text("Use 1 to 16 characters with no spaces.") }
         .alert("Something went wrong", isPresented: Binding(
-            get: { link.problem != nil },
-            set: { if !$0 { link.problem = nil } }
-        )) {
-            Button("OK", role: .cancel) {}
-        } message: {
-            Text(link.problem ?? "")
-        }
-        // The face follows the name: the skin of the Minecraft account that has it.
+            get: { link.problem != nil }, set: { if !$0 { link.problem = nil } }
+        )) { Button("OK", role: .cancel) {} } message: { Text(link.problem ?? "") }
         .task(id: shownName) { await head.load(shownName) }
-        // A signed-in account goes to the game, renewed when it is close to expiring.
         .task(id: account.profile) { await account.handOver() }
         .onChange(of: account.profile) { profile in
-            if profile != nil {
-                editingName = false
-                nameDraft = ""
-            }
+            if profile != nil { editingName = false; nameDraft = "" }
         }
-        .task {
-            link.uncover = onPlay
-            await link.watch()
-        }
+        .task { link.uncover = onPlay; await link.watch() }
     }
 
-    private var navigationRail: some View {
-        VStack(spacing: 8) {
-            ForEach(Tab.allCases, id: \.self) { item in
-                Button { tab = item } label: {
-                    HStack(spacing: 12) {
-                        Image(systemName: item.icon)
-                            .font(.system(size: 17, weight: .medium))
-                            .frame(width: 24)
-                        Text(item.title).font(Theme.pixel(21))
-                        Spacer(minLength: 0)
-                    }
-                    .foregroundStyle(tab == item ? Theme.text : Theme.textMuted)
-                    .padding(.horizontal, 16)
-                    .frame(minHeight: 52)
-                    .background(tab == item ? Theme.notice : Color.clear,
-                                in: RoundedRectangle(cornerRadius: 10))
-                }
-                .buttonStyle(PressStyle())
-                .accessibilityAddTraits(tab == item ? .isSelected : [])
-            }
-            Spacer(minLength: 0)
-        }
-        .padding(16)
-        .padding(.top, 12)
-        .background(Theme.surfaceSunken)
-    }
-
-    @ViewBuilder
-    private func content(for item: Tab) -> some View {
-        switch item {
-        case .play:
-            page(maximumWidth: 1440, refresh: { await link.reload() }) { width in
-                PlayPage(link: link, device: device, download: download, player: player,
-                         head: head, account: account, editName: editName, availableWidth: width)
-            }
-        case .servers:
-            page(refresh: { await link.reloadServers() }) { _ in ServersPage(link: link, account: account) }
-        case .packs:
-            page { _ in PacksPage(link: link) }
-        case .gallery:
-            page { _ in GalleryPage() }
-        case .settings:
-            page { _ in SettingsPage(link: link, download: download) }
-        }
-    }
-
-    /// Size content from the actual window, including Split View and portrait rotation.
-    private func page<Content: View>(maximumWidth: CGFloat = 1080,
-                                     refresh: (() async -> Void)? = nil,
-                                     @ViewBuilder _ content: @escaping (CGFloat) -> Content) -> some View {
-        GeometryReader { geometry in
-            let gutter: CGFloat = geometry.size.width >= 700 ? 28 : 20
-            let width = max(0, min(geometry.size.width, maximumWidth) - gutter * 2)
-            ScrollView {
-                content(width)
-                    .frame(maxWidth: .infinity, alignment: .topLeading)
-                    .padding(.horizontal, gutter)
-                    .padding(.top, 24)
-                    .padding(.bottom, 32)
-                    .frame(maxWidth: maximumWidth)
-                    .frame(maxWidth: .infinity)
-            }
-            .refreshable { await refresh?() }
-        }
-    }
-
-    /// The Microsoft account's name when one is signed in, else the offline name.
     private var shownName: String? { account.profile?.name ?? player.name }
 
     private func editName() {
@@ -191,339 +103,241 @@ struct HomeView: View {
         nameDraft = player.name ?? ""
         editingName = true
     }
-}
 
-// MARK: - Header
-
-private struct Header: View {
-    let name: String?
-    let face: UIImage?
-    let canEditName: Bool
-    let editName: () -> Void
-
-    var body: some View {
-        HStack {
-            HStack(spacing: 10) {
-                HorizonMark()
-                Text("HORIZON")
-                    .font(Theme.pixel(25, .bold))
-                    .foregroundStyle(Theme.text)
+    private func destination(_ item: Destination) -> some View {
+        page {
+            switch item {
+            case .play: home
+            case .worlds: WorldsSection(link: link, newWorld: { sheet = .newWorld })
+            case .servers: ServersPage(link: link, account: account)
+            case .packs: PacksPage(link: link)
+            case .settings:
+                VStack(spacing: 24) {
+                    SettingsPage(link: link, download: download)
+                    NavigationLink { page { GalleryPage() }.navigationTitle("Screenshots") } label: {
+                        Label("Screenshots", systemImage: "photo.on.rectangle")
+                            .frame(maxWidth: .infinity, alignment: .leading).padding(16).card()
+                    }
+                }
             }
-            Spacer()
-            if canEditName {
-                Button(action: editName) {
-                    Avatar(name: name, face: face, size: 40)
+        }
+        .navigationTitle(item.title)
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Button { sheet = .account } label: {
+                    Avatar(name: shownName, face: head.face, size: 30)
                         .frame(minWidth: 44, minHeight: 44)
-                        .contentShape(Rectangle())
                 }
-                .accessibilityLabel("Change offline name: \(name ?? "not set")")
-            } else {
-                HStack(spacing: 10) {
-                    Text(name ?? "").font(Theme.sans(14, .semiBold)).foregroundStyle(Theme.text)
-                        .lineLimit(1)
-                    Avatar(name: name, face: face, size: 40)
-                }
-                .accessibilityElement(children: .ignore)
-                .accessibilityLabel("Microsoft account: \(name ?? "")")
+                .accessibilityLabel("Account: \(shownName ?? "Not signed in")")
+                .accessibilityIdentifier("launcher-account-button")
             }
         }
-        .padding(.horizontal, 20)
-        .frame(height: 62)
+    }
+
+    private func page<Content: View>(@ViewBuilder _ content: () -> Content) -> some View {
+        ScrollView {
+            content()
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(sizeClass == .regular ? 32 : 20)
+                .frame(maxWidth: sizeClass == .regular ? 1200 : 700)
+                .frame(maxWidth: .infinity)
+        }
         .background(Theme.background)
+        .refreshable { await link.reload() }
     }
-}
 
-/// Horizon's plus-shaped mark: a violet horizon crossed by a white stroke.
-private struct HorizonMark: View {
-    var body: some View {
-        ZStack {
-            Rectangle().fill(Theme.accentBright).frame(width: 22, height: 3)
-            Rectangle().fill(Theme.text).frame(width: 3, height: 22)
-        }
-        .frame(width: 22, height: 22)
-    }
-}
-
-/// The player's skin face, its pixels kept sharp; the name's first letter until a skin is found.
-struct Avatar: View {
-    let name: String?
-    let face: UIImage?
-    let size: CGFloat
-
-    var body: some View {
-        Group {
-            if let face {
-                Image(uiImage: face)
-                    .resizable()
-                    .interpolation(.none)
-                    .padding(size * 0.12)
-            } else {
-                Text(name.map { String($0.prefix(1)).lowercased() } ?? "?")
-                    .font(Theme.pixel(size * 0.52, .medium))
-                    .foregroundStyle(Theme.text)
-            }
-        }
-        .frame(width: size, height: size)
-        .background(Theme.notice, in: RoundedRectangle(cornerRadius: size * 0.3))
-        .overlay(RoundedRectangle(cornerRadius: size * 0.3).strokeBorder(Theme.border))
-    }
-}
-
-// MARK: - Play
-
-private struct PlayPage: View {
-    @ObservedObject var link: GameLink
-    @ObservedObject var device: DeviceStatus
-    @ObservedObject var download: GameFilesDownload
-    @ObservedObject var player: PlayerName
-    @ObservedObject var head: SkinHead
-    @ObservedObject var account: MicrosoftAccount
-    let editName: () -> Void
-    let availableWidth: CGFloat
-    @Environment(\.dynamicTypeSize) private var typeSize
-
-    var body: some View {
-        Group {
-            if availableWidth >= 760 && !typeSize.isAccessibilitySize {
-                HStack(alignment: .top, spacing: 24) {
-                    VStack(alignment: .leading, spacing: 24) {
-                        GameCard(link: link, device: device, spacious: true)
-                        if needsFiles { GameFilesCard(download: download, missing: true) }
-                        WorldsSection(link: link)
-                    }
-                    .frame(maxWidth: .infinity, alignment: .topLeading)
-                    VStack(alignment: .leading, spacing: 16) {
-                        if let last = link.worlds.first { ContinueCard(world: last, link: link) }
-                        identity
-                        AccountCard(account: account)
-                    }
-                    .frame(width: min(340, availableWidth * 0.34), alignment: .topLeading)
+    private var home: some View {
+        VStack(alignment: .leading, spacing: 28) {
+            launchPanel
+            if needsFiles { GameFilesCard(download: download, missing: true) }
+            ViewThatFits(in: .horizontal) {
+                HStack(alignment: .top, spacing: 28) {
+                    recentWorlds.frame(minWidth: 520, maxWidth: .infinity)
+                    VStack(spacing: 14) {
+                        quickLink("Multiplayer", detail: "Your saved servers", icon: "network", destination: .servers)
+                        quickLink("Personalize", detail: "Textures & shaders", icon: "square.stack.3d.up", destination: .packs)
+                    }.frame(width: 280).padding(.top, 56)
                 }
-            } else {
-                compact
+                VStack(alignment: .leading, spacing: 24) {
+                    recentWorlds
+                    HStack(spacing: 14) {
+                        quickLink("Multiplayer", detail: "Saved servers", icon: "network", destination: .servers)
+                        quickLink("Personalize", detail: "Packs & shaders", icon: "square.stack.3d.up", destination: .packs)
+                    }
+                }
             }
         }
-        .animation(.easeInOut(duration: 0.25), value: link.phase)
-        .animation(.easeInOut(duration: 0.25), value: link.worlds)
     }
 
-    private var identity: some View {
-        PlayerCard(name: account.profile?.name ?? player.name, face: head.face,
-                   signedIn: account.profile != nil, edit: editName)
+    private var launchPanel: some View {
+        VStack(alignment: .leading, spacing: 22) {
+            HStack(spacing: 8) {
+                Text("JAVA EDITION · \(link.version)").font(.caption.weight(.semibold)).tracking(1.4)
+            }
+            .foregroundStyle(.white.opacity(0.9))
+            Spacer(minLength: 22)
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(spacing: 14) {
+                    Kit.image("horizon-mark").resizable().renderingMode(.template)
+                        .scaledToFit().frame(width: 54, height: 54).accessibilityHidden(true)
+                    Text("Horizon").font(.system(.largeTitle, design: .rounded).bold())
+                }
+                .foregroundStyle(.white)
+                .padding(.top, 8)
+                HStack(spacing: 8) {
+                    Avatar(name: shownName, face: head.face, size: 26)
+                    Text(shownName ?? "Offline player").font(.subheadline.weight(.medium)).lineLimit(1)
+                    if account.profile != nil {
+                        Image(systemName: "checkmark.seal.fill").font(.caption)
+                            .accessibilityLabel("Microsoft account")
+                    }
+                }.foregroundStyle(.white.opacity(0.9))
+                    .accessibilityIdentifier("launcher-playing-as")
+            }
+            HStack {
+                Button { Task { await link.play() } } label: {
+                    Label(playLabel, systemImage: "play.fill")
+                        .font(.headline).frame(minWidth: 124, minHeight: 36)
+                }
+                .controlSize(.large)
+                .launcherPrimaryButton()
+                .tint(.blue)
+                .disabled(needsFiles || link.launching != nil)
+                .accessibilityIdentifier("launcher-play-button")
+                if link.launching != nil {
+                    Button("Cancel") { link.cancelLaunch() }.foregroundStyle(.white).frame(minHeight: 44)
+                }
+                Spacer(minLength: 0)
+            }
+            if case let .loading(progress) = link.phase {
+                ProgressView(value: progress).tint(.white).accessibilityLabel("Loading game")
+            }
+        }
+        .padding(sizeClass == .regular ? 32 : 24)
+        .frame(maxWidth: .infinity, minHeight: sizeClass == .regular ? 350 : 300, alignment: .leading)
+        .background {
+            LauncherLandscape(index: 0)
+                .overlay(LinearGradient(colors: [.black.opacity(0.05), .black.opacity(0.72)],
+                                        startPoint: .topTrailing, endPoint: .bottomLeading))
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 28))
     }
 
-    private var compact: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            GameCard(link: link, device: device)
-            if needsFiles {
-                GameFilesCard(download: download, missing: true)
+    private var recentWorlds: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("Jump back in").font(.title3.bold())
+                Spacer()
+                Button("All Worlds") { tab = .worlds }.font(.subheadline.weight(.medium)).frame(minHeight: 44)
             }
-            if let last = link.worlds.first {
-                ContinueCard(world: last, link: link)
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 16) {
+                    ForEach(Array(link.worlds.prefix(4).enumerated()), id: \.element.id) { index, world in
+                        Button { Task { await link.play(world) } } label: {
+                            VStack(alignment: .leading, spacing: 10) {
+                                ZStack(alignment: .bottomLeading) {
+                                    LauncherLandscape(index: index + 1, world: world)
+                                    LinearGradient(colors: [.clear, .black.opacity(0.4)], startPoint: .top, endPoint: .bottom)
+                                    HStack {
+                                        Label(world.mode.capitalized, systemImage: world.mode == "creative" ? "cube" : "leaf")
+                                            .font(.caption.weight(.medium))
+                                        Spacer()
+                                        Image(systemName: "play.circle.fill").font(.title2)
+                                    }.foregroundStyle(.white).padding(14)
+                                }
+                                .frame(height: 138).clipShape(RoundedRectangle(cornerRadius: 18))
+                                Text(world.name).font(.headline).foregroundStyle(.primary).lineLimit(1)
+                                Text(world.lastPlayed, style: .relative).font(.caption).foregroundStyle(.secondary)
+                            }.frame(width: sizeClass == .regular ? 260 : 230, alignment: .leading)
+                        }
+                        .buttonStyle(.plain).disabled(link.launching != nil)
+                    }
+                    Button { tab = .worlds } label: {
+                        VStack(spacing: 12) {
+                            Image(systemName: "plus.circle").font(.largeTitle.weight(.light))
+                            Text("Explore your worlds").font(.subheadline.weight(.medium))
+                        }
+                        .foregroundStyle(.secondary)
+                        .frame(width: link.worlds.isEmpty ? 280 : 180, height: 138)
+                        .background(Theme.surface, in: RoundedRectangle(cornerRadius: 18))
+                        .padding(.bottom, 52)
+                    }.buttonStyle(.plain)
+                }
             }
-            WorldsSection(link: link)
-            identity
-            AccountCard(account: account)
         }
     }
 
-    /// The game said it has nothing to load, or, before it starts, there are no game files to start it with.
+    private func quickLink(_ title: String, detail: String, icon: String, destination: Destination) -> some View {
+        Button { tab = destination } label: {
+            VStack(alignment: .leading, spacing: 18) {
+                HStack {
+                    Image(systemName: icon).font(.title2.weight(.medium))
+                        .frame(width: 44, height: 44)
+                        .foregroundStyle(.blue).background(.blue.opacity(0.10), in: RoundedRectangle(cornerRadius: 14))
+                    Spacer(minLength: 0)
+                    Image(systemName: "arrow.up.right").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                }
+                VStack(alignment: .leading, spacing: 5) {
+                    Text(title).font(.headline).foregroundStyle(.primary).lineLimit(1).minimumScaleFactor(0.85)
+                    Text(detail).font(.caption).foregroundStyle(.secondary)
+                }
+            }.padding(20).frame(maxWidth: .infinity, alignment: .leading)
+                .background(Theme.surface, in: RoundedRectangle(cornerRadius: 22))
+        }.buttonStyle(.plain)
+    }
+
+    private var playLabel: String { link.launching ?? (needsFiles ? "Game files needed" : "Play") }
     private var needsFiles: Bool {
         if case .needsFiles = link.phase { return true }
         return link.phase == .waiting && !GameFolder.hasGameFiles
     }
-}
 
-private struct GameCard: View {
-    @ObservedObject var link: GameLink
-    @ObservedObject var device: DeviceStatus
-    var spacious = false
-
-    var body: some View {
-        VStack(spacing: 0) {
-            Hero(version: link.version, spacious: spacious)
-            VStack(spacing: 12) {
-                StatusChips(link: link, device: device)
-                PlayButton(link: link)
-            }
-            .padding(16)
+    private var newWorldSheet: some View {
+        NewWorldSheet { settings in
+            sheet = nil
+            Task { await link.create(settings) }
         }
-        .background(Theme.surface)
-        .clipShape(RoundedRectangle(cornerRadius: 16))
-        .overlay(RoundedRectangle(cornerRadius: 16).strokeBorder(Theme.border))
     }
-}
 
-private struct Hero: View {
-    let version: String
-    var spacious = false
-    /// Picked once per showing, as the title screen picks one per start.
-    @State private var splash = Splash.pick()
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            HStack(spacing: 6) {
-                Rectangle().fill(Theme.ready).frame(width: 5, height: 5)
-                Text("MINECRAFT \(version)").font(Theme.mono(9)).foregroundStyle(Theme.text)
-            }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 6)
-            .background(Color(red: 16 / 255, green: 13 / 255, blue: 32 / 255, opacity: 0.8), in: RoundedRectangle(cornerRadius: 4))
-            VStack(alignment: .leading, spacing: 6) {
-                Text("Horizon").font(Theme.pixel(spacious ? 56 : 44)).foregroundStyle(Theme.text)
-                    .overlay(alignment: .topTrailing) {
-                        if let splash {
-                            Splash(text: splash)
-                                .offset(x: 70, y: 18)
-                                .onTapGesture {
-                                    Haptics.tap()
-                                    self.splash = Splash.pick()
-                                }
+    private var accountSheet: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    HStack(spacing: 16) {
+                        Avatar(name: shownName, face: head.face, size: 52)
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(shownName ?? "Offline player").font(.headline)
+                            Text(account.profile == nil ? "Offline profile" : "Microsoft account")
+                                .font(.subheadline).foregroundStyle(.secondary)
                         }
-                    }
-                Text("Your next world is waiting.").font(Theme.sans(12)).foregroundStyle(Color(hex: 0xDDD2ED))
+                    }.padding(.vertical, 8)
+                    if account.profile == nil { Button("Change Offline Name", action: editName) }
+                }
+                Section { AccountCard(account: account) }
             }
-            .padding(.top, 35)
-            Spacer(minLength: 0)
+            .navigationTitle("Account")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { sheet = nil } } }
         }
-        .padding(spacious ? 28 : 20)
-        .frame(maxWidth: .infinity, alignment: .topLeading)
-        .frame(height: spacious ? 292 : 214, alignment: .topLeading)
-        .background {
-            Kit.image("pixel-sunset")
-                .resizable()
-                .interpolation(.none)
-                .scaledToFill()
-                .overlay(
-                    LinearGradient(
-                        colors: [
-                            Color(red: 16 / 255, green: 12 / 255, blue: 34 / 255, opacity: 0.2),
-                            Color(red: 16 / 255, green: 12 / 255, blue: 34 / 255, opacity: 0.91),
-                        ],
-                        startPoint: .top,
-                        endPoint: .bottom
-                    )
-                )
-        }
-        .clipped()
+        .presentationDetents([.medium, .large])
     }
 }
 
-/// Play, in every state the game can be in: loading (the bar fills behind the word), waiting to take the
-/// player somewhere (it says where, and can be cancelled), and with no game files (it says so).
-private struct PlayButton: View {
-    @ObservedObject var link: GameLink
-
-    var body: some View {
-        VStack(spacing: 8) {
-            Button {
-                Task { await link.play() }
-            } label: {
-                HStack(spacing: 10) {
-                    if link.launching != nil {
-                        ProgressView().tint(Theme.text)
-                    } else {
-                        Kit.image("play")
-                    }
-                    Text(label).font(Theme.pixel(label.count > 12 ? 20 : 27)).foregroundStyle(Theme.text)
-                        .lineLimit(1).minimumScaleFactor(0.6)
-                }
-                .padding(.horizontal, 12)
-                .frame(maxWidth: .infinity, minHeight: 54, maxHeight: 54)
-                .background(alignment: .leading) {
-                    GeometryReader { size in
-                        ZStack(alignment: .leading) {
-                            (missing ? Theme.surfaceDisabled : Theme.accent.opacity(fill < 1 ? 0.55 : 1))
-                            if fill < 1 {
-                                Theme.accent.frame(width: size.size.width * fill)
-                            }
-                        }
-                    }
-                }
-                // The design's lit top edge: a one-point border on the top side only.
-                .overlay(alignment: .top) { (missing ? Color.clear : Theme.accentEdge).frame(height: 1) }
-                .clipShape(RoundedRectangle(cornerRadius: 8))
-                .animation(.easeOut(duration: 0.3), value: fill)
-            }
-            .buttonStyle(PressStyle())
-            .accessibilityIdentifier("launcher-play-button")
-            .disabled(missing || link.launching != nil)
-            if link.launching != nil {
-                Button("Cancel") { link.cancelLaunch() }
-                    .font(Theme.sans(12, .semiBold)).foregroundStyle(Theme.textMuted)
-            }
-        }
-    }
-
-    private var missing: Bool {
-        if case .needsFiles = link.phase { return true }
-        return false
-    }
-
-    /// How full the bar is: the loading progress, full once the game is ready.
-    private var fill: Double {
-        if case let .loading(progress) = link.phase { return max(progress, 0.04) }
-        return 1
-    }
-
-    private var label: String {
-        if let launching = link.launching { return launching }
-        return missing ? "Game files needed" : "Play"
-    }
-}
-
-/// The world played last, one tap away.
-private struct ContinueCard: View {
-    let world: World
-    @ObservedObject var link: GameLink
-
-    var body: some View {
-        Button {
-            Task { await link.play(world) }
-        } label: {
-            HStack(spacing: 12) {
-                WorldIcon(world: world, size: 56)
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("CONTINUE").font(Theme.mono(8)).foregroundStyle(Theme.accentText)
-                    Text(world.name).font(Theme.pixel(19)).foregroundStyle(Theme.text).lineLimit(1)
-                    Text(world.subtitle).font(Theme.sans(11)).foregroundStyle(Theme.textMuted).lineLimit(1)
-                }
-                Spacer(minLength: 0)
-                Image(systemName: "play.circle.fill").font(.system(size: 30)).foregroundStyle(Theme.accentBright)
-            }
-            .padding(12)
-            .card()
-        }
-        .buttonStyle(PressStyle())
-        .disabled(link.launching != nil)
-    }
-}
-
-// MARK: - The player
-
-private struct PlayerCard: View {
+struct Avatar: View {
     let name: String?
     let face: UIImage?
-    let signedIn: Bool
-    let edit: () -> Void
-
+    let size: CGFloat
     var body: some View {
-        HStack(spacing: 12) {
-            Avatar(name: name, face: face, size: 48)
-            VStack(alignment: .leading, spacing: 4) {
-                Text("PLAYING AS").font(Theme.mono(8)).foregroundStyle(Theme.textMuted)
-                Text(name ?? "No name yet").font(Theme.sans(15, .semiBold)).foregroundStyle(Theme.text)
-                    .lineLimit(1)
-            }
-            Spacer(minLength: 0)
-            if !signedIn {
-                Button(action: edit) {
-                    Text("Change").font(Theme.sans(12, .semiBold)).foregroundStyle(Theme.accentText)
-                        .frame(minWidth: 44, minHeight: 44)
-                }
+        Group {
+            if let face {
+                Image(uiImage: face).resizable().interpolation(.none).scaledToFit().padding(size * 0.10)
+            } else {
+                Image(systemName: "person.fill").resizable().scaledToFit().padding(size * 0.24)
+                    .foregroundStyle(.secondary)
             }
         }
-        .padding(14)
-        .card()
+        .frame(width: size, height: size)
+        .background(Theme.surfaceDisabled, in: RoundedRectangle(cornerRadius: size * 0.3))
+        .accessibilityHidden(true)
     }
 }

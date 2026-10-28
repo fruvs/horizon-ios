@@ -29,7 +29,7 @@ private func presentDownload(attempts: Int) {
         return
     }
     let model = DownloadModel()
-    let host = DownloadHostingController(rootView: AnyView(DownloadView(model: model).preferredColorScheme(.dark)))
+    let host = DownloadHostingController(rootView: AnyView(DownloadView(model: model)))
     model.close = { [weak host] in
         // The screen may sleep again, and the game turns back to its landscape.
         UIApplication.shared.isIdleTimerDisabled = false
