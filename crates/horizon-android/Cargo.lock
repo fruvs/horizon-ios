@@ -1279,6 +1279,7 @@ dependencies = [
  "horizon-core",
  "horizon-friends",
  "horizon-gamecontroller",
+ "horizon-ios-launcher",
  "horizon-mods",
  "horizon-protocol",
  "horizon-shader-api",
@@ -1288,6 +1289,7 @@ dependencies = [
  "horizon-world",
  "log",
  "pollster",
+ "serde",
  "serde_json",
  "stacker",
  "wgpu",
@@ -1332,6 +1334,7 @@ dependencies = [
  "horizon-friends",
  "horizon-gamecontroller",
  "horizon-hdr",
+ "horizon-ios-launcher",
  "horizon-mods",
  "horizon-protocol",
  "horizon-server-files",
@@ -1353,6 +1356,7 @@ dependencies = [
  "sha2",
  "stacker",
  "symphonia",
+ "unicode-bidi",
  "ureq",
  "wgpu",
  "winit",
@@ -1421,6 +1425,14 @@ version = "0.1.0"
 dependencies = [
  "ash",
  "wgpu",
+]
+
+[[package]]
+name = "horizon-ios-launcher"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "log",
 ]
 
 [[package]]
@@ -3569,6 +3581,12 @@ name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
+
+[[package]]
+name = "unicode-bidi"
+version = "0.3.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c1cb5db39152898a79168971543b1cb5020dff7fe43c8dc468b0885f5e29df5"
 
 [[package]]
 name = "unicode-ident"
