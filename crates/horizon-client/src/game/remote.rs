@@ -263,7 +263,7 @@ pub(super) struct Remote {
     /// `ClientPacketListener.playerInfoMap` as player-list entries, and
     /// which of them are listed.
     tab_players: HashMap<u128, horizon_client::tab_list::TabPlayer>,
-    /// Each listed profile's unpacked `textures` property.
+    /// Profile textures, retained for living NPC entities even after tab-list removal.
     skin_textures: HashMap<u128, horizon_client::skins::Textures>,
     /// The skin texture each profile's players show, once its download is ready.
     skins: HashMap<u128, String>,
@@ -1167,6 +1167,12 @@ impl Game<'_> {
                 // The entity ids are the old world's; the new dimension's
                 // player entities re-map to their profiles on AddEntity.
                 r.level_players.clear();
+                let local = r.profile;
+                let tab = &r.tab_players;
+                r.skin_textures
+                    .retain(|uuid, _| *uuid == local || tab.contains_key(uuid));
+                r.skins
+                    .retain(|uuid, _| *uuid == local || tab.contains_key(uuid));
                 // A new ClientLevel: a new chunk storage, centred on 0, 0.
                 r.chunk_center = (0, 0);
             }
@@ -1984,10 +1990,20 @@ impl Game<'_> {
                 let rotation =
                     [p.yaw, p.pitch, p.head_yaw].map(horizon_protocol::buf::unpack_degrees);
                 if let Some(r) = self.remote.as_mut() {
-                    if kind == "minecraft:player" {
-                        r.level_players.insert(p.id, p.uuid);
+                    let old = if kind == "minecraft:player" {
+                        r.level_players.insert(p.id, p.uuid)
                     } else {
-                        r.level_players.remove(&p.id);
+                        r.level_players.remove(&p.id)
+                    };
+                    if let Some(uuid) = old {
+                        prune_remote_skin(
+                            uuid,
+                            r.profile,
+                            &r.level_players,
+                            &r.tab_players,
+                            &mut r.skin_textures,
+                            &mut r.skins,
+                        );
                     }
                 }
                 self.spawn_entity(p.id, p.uuid, &kind, p.position, rotation);
@@ -2013,8 +2029,17 @@ impl Game<'_> {
             }
             C::RemoveEntities(p) => {
                 for id in p.ids {
-                    if let Some(r) = self.remote.as_mut() {
-                        r.level_players.remove(&id);
+                    if let Some(r) = self.remote.as_mut()
+                        && let Some(uuid) = r.level_players.remove(&id)
+                    {
+                        prune_remote_skin(
+                            uuid,
+                            r.profile,
+                            &r.level_players,
+                            &r.tab_players,
+                            &mut r.skin_textures,
+                            &mut r.skins,
+                        );
                     }
                     self.remove_entity(id);
                 }
@@ -2882,7 +2907,12 @@ impl Game<'_> {
                                     };
                                     let textures =
                                         skins::unpack(&t.value, signature, &skins::TEXTURE_URIS);
-                                    r.skin_textures.entry(e.uuid).or_insert(textures);
+                                    replace_remote_skin(
+                                        e.uuid,
+                                        textures,
+                                        &mut r.skin_textures,
+                                        &mut r.skins,
+                                    );
                                 }
                                 // No skin from the server (single player, LAN, offline mode): the one
                                 // the name wears on Ely.by.
@@ -2934,8 +2964,15 @@ impl Game<'_> {
                     for u in p.uuids {
                         r.players.remove(&u);
                         r.tab_players.remove(&u);
-                        r.skin_textures.remove(&u);
                         r.listed.remove(&u);
+                        prune_remote_skin(
+                            u,
+                            r.profile,
+                            &r.level_players,
+                            &r.tab_players,
+                            &mut r.skin_textures,
+                            &mut r.skins,
+                        );
                     }
                 }
             }
@@ -3168,8 +3205,11 @@ impl Game<'_> {
             return;
         };
         for (uuid, textures) in r.ely_skins.take() {
-            // Still listed, and still without a skin of the server's own.
-            if r.players.contains_key(&uuid) || r.tab_players.contains_key(&uuid) {
+            // Still listed or in the level, and without a skin of the server's own.
+            if r.players.contains_key(&uuid)
+                || r.tab_players.contains_key(&uuid)
+                || r.level_players.values().any(|&profile| profile == uuid)
+            {
                 let entry = r.skin_textures.entry(uuid).or_default();
                 if entry.skin.is_none() {
                     *entry = textures;
@@ -6332,9 +6372,95 @@ impl Remote {
     }
 }
 
+/// A repeated ADD_PLAYER carries the new profile, rather than freezing the first skin forever.
+fn replace_remote_skin(
+    uuid: u128,
+    value: horizon_client::skins::Textures,
+    textures: &mut HashMap<u128, horizon_client::skins::Textures>,
+    resolved: &mut HashMap<u128, String>,
+) {
+    if textures.get(&uuid) != Some(&value) {
+        resolved.remove(&uuid);
+    }
+    textures.insert(uuid, value);
+}
+
+/// AbstractClientPlayer caches its PlayerInfo after it leaves the tab list. Keep the
+/// texture lookup for those entities, then release it after the final reference disappears.
+fn prune_remote_skin(
+    uuid: u128,
+    local: u128,
+    entities: &HashMap<i32, u128>,
+    tab: &HashMap<u128, horizon_client::tab_list::TabPlayer>,
+    textures: &mut HashMap<u128, horizon_client::skins::Textures>,
+    resolved: &mut HashMap<u128, String>,
+) {
+    if uuid != local
+        && !entities.values().any(|&profile| profile == uuid)
+        && !tab.contains_key(&uuid)
+    {
+        textures.remove(&uuid);
+        resolved.remove(&uuid);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::Game;
+
+    #[test]
+    fn refreshed_npc_profiles_replace_stale_textures_without_dropping_identical_ones() {
+        use super::*;
+        let mut textures = HashMap::new();
+        let mut resolved = HashMap::new();
+        let old = horizon_client::skins::Textures {
+            skin: Some("https://textures.minecraft.net/texture/old".into()),
+            signed: true,
+            ..Default::default()
+        };
+        replace_remote_skin(42, old.clone(), &mut textures, &mut resolved);
+        resolved.insert(42, "skins/old".into());
+        replace_remote_skin(42, old, &mut textures, &mut resolved);
+        assert!(resolved.contains_key(&42));
+        let new = horizon_client::skins::Textures {
+            skin: Some("https://textures.minecraft.net/texture/new".into()),
+            signed: true,
+            slim: true,
+            ..Default::default()
+        };
+        replace_remote_skin(42, new.clone(), &mut textures, &mut resolved);
+        assert_eq!(textures.get(&42), Some(&new));
+        assert!(!resolved.contains_key(&42));
+    }
+
+    #[test]
+    fn npc_texture_lifetime_follows_entities_as_well_as_tab_entries() {
+        use super::*;
+        let uuid = 42;
+        let mut entities = HashMap::from([(12, uuid), (13, uuid)]);
+        let mut tab = HashMap::new();
+        let original = horizon_client::skins::Textures {
+            skin: Some("https://textures.minecraft.net/texture/npc".into()),
+            signed: true,
+            ..Default::default()
+        };
+        let mut textures = HashMap::from([(uuid, original.clone())]);
+        let mut resolved = HashMap::from([(uuid, "skins/npc".to_owned())]);
+        // Tab removal does not affect an active NPC, including pending downloads.
+        prune_remote_skin(uuid, 0, &entities, &tab, &mut textures, &mut resolved);
+        assert_eq!(textures.get(&uuid), Some(&original));
+        entities.remove(&12);
+        prune_remote_skin(uuid, 0, &entities, &tab, &mut textures, &mut resolved);
+        assert!(resolved.contains_key(&uuid));
+        // A listed player keeps their lookup even if the entity has unloaded.
+        tab.insert(uuid, horizon_client::tab_list::TabPlayer::new(uuid, "NPC"));
+        entities.clear();
+        prune_remote_skin(uuid, 0, &entities, &tab, &mut textures, &mut resolved);
+        assert!(textures.contains_key(&uuid));
+        tab.clear();
+        prune_remote_skin(uuid, 0, &entities, &tab, &mut textures, &mut resolved);
+        assert!(textures.is_empty() && resolved.is_empty());
+    }
 
     #[test]
     fn remote_team_packets_control_pushes_using_profile_names_and_entity_uuids() {
