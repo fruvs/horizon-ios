@@ -10,6 +10,14 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+  pull_request:
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'crates/**'
+      - 'third_party/**'
+      - 'packaging/android/**'
+      - '.github/workflows/android.yml'
 permissions:
   contents: read
 concurrency:
@@ -54,13 +62,14 @@ jobs:
           cargo build --release --locked --manifest-path crates/horizon-android/Cargo.toml --target "$ANDROID_TARGET"
       - name: Pack and sign the .apk
         env:
-          KEYSTORE: ${{ secrets.ANDROID_KEYSTORE }}
-          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          # PR code is unmerged: always use the throwaway key, even for same-repository PRs.
+          KEYSTORE: ${{ github.event_name != 'pull_request' && secrets.ANDROID_KEYSTORE || '' }}
+          KEYSTORE_PASSWORD: ${{ github.event_name != 'pull_request' && secrets.ANDROID_KEYSTORE_PASSWORD || '' }}
         run: |
           set -euo pipefail
           sdk="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
-          tools="$sdk/build-tools/$(ls "$sdk/build-tools" | sort -V | tail -1)"
-          platform="$sdk/platforms/$(ls "$sdk/platforms" | sort -V | tail -1)"
+          tools="$(find "$sdk/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)"
+          platform="$(find "$sdk/platforms" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)"
           work=$(mktemp -d)
           mkdir -p "$work/res/mipmap-xxxhdpi" "$work/apk/lib/arm64-v8a"
           cp packaging/icons/hicolor/256x256/apps/horizon.png "$work/res/mipmap-xxxhdpi/ic_launcher.png"
