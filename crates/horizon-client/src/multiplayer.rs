@@ -1275,18 +1275,20 @@ impl Screen {
             scroll.release();
         }
     }
-    /// The focused box, in GUI pixels: name at 66, address at 106
-    /// (`ManageServerScreen`), direct address at 116, friend fields at 64 and 105.
-    pub fn focused_box(&self, (w, _h): (f32, f32)) -> Option<[f32; 4]> {
-        let y = match self {
-            Self::Edit { focus: 0, .. } => 66.0,
-            Self::Edit { .. } => 106.0,
-            Self::Direct { .. } => 116.0,
-            Self::Friend { focus: 0, .. } => 64.0,
-            Self::Friend { .. } => 105.0,
-            _ => return None,
-        };
-        Some([(w / 2.0).floor() - 100.0, y, 200.0, 20.0])
+    /// The focused text box on screen (GUI pixels): the field a phone's keyboard belongs to, so a touch
+    /// outside it can put the keyboard away. `Direct` has one box and it always has the focus.
+    pub fn focused_rect(&self, (w, _h): (f32, f32)) -> Option<[f32; 4]> {
+        let x = (w.ceil() / 2.0).floor() - 100.0;
+        match self {
+            Self::Edit { focus, .. } => {
+                Some([x, if *focus == 0 { 66.0 } else { 106.0 }, 200.0, 20.0])
+            }
+            Self::Direct { .. } => Some([x, 116.0, 200.0, 20.0]),
+            Self::Friend { focus, .. } => {
+                Some([x, if *focus == 0 { 64.0 } else { 105.0 }, 200.0, 20.0])
+            }
+            _ => None,
+        }
     }
     fn focused_field(&mut self) -> Option<&mut String> {
         match self {

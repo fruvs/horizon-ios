@@ -159,7 +159,7 @@ impl Panorama {
             ],
         });
         let shader = crate::gfx::shader_module(
-            &device,
+            device,
             wgpu::ShaderModuleDescriptor {
                 label: Some("Title panorama shader"),
                 source: wgpu::ShaderSource::Wgsl(include_str!("panorama.wgsl").into()),
@@ -171,7 +171,7 @@ impl Panorama {
             ..Default::default()
         });
         let pipeline = crate::gfx::render_pipeline(
-            &device,
+            device,
             &wgpu::RenderPipelineDescriptor {
                 label: Some("Title panorama"),
                 layout: Some(&pipeline_layout),

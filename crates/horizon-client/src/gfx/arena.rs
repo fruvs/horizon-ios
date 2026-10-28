@@ -120,7 +120,10 @@ impl Arena {
         usage: wgpu::BufferUsages,
     ) -> Self {
         // 256 MiB pages, or less where the device's buffers are smaller.
-        let bytes = device.limits().max_buffer_size.min(PAGE_BYTES);
+        let mut bytes = device.limits().max_buffer_size.min(PAGE_BYTES);
+        if usage.contains(wgpu::BufferUsages::STORAGE) {
+            bytes = bytes.min(device.limits().max_storage_buffer_binding_size);
+        }
         let page_limit = (bytes / stride) / GRAIN * GRAIN;
         let capacity = capacity.next_multiple_of(GRAIN).min(page_limit);
         Self {
@@ -178,6 +181,9 @@ impl Arena {
         self.pages.iter().flatten().map(|p| p.capacity).sum::<u64>() * self.stride
     }
     /// The most vertices a page holds.
+    pub fn shader_readable(&self) -> bool {
+        self.usage.contains(wgpu::BufferUsages::STORAGE)
+    }
     pub fn page_vertices(&self) -> u64 {
         self.page_limit
     }
@@ -330,7 +336,11 @@ impl Arena {
 
 /// `create_buffer` with an out-of-memory failure returned instead of raised
 /// (raised errors are fatal).
-fn try_create(device: &wgpu::Device, size: u64, usage: wgpu::BufferUsages) -> Option<wgpu::Buffer> {
+pub(super) fn try_create(
+    device: &wgpu::Device,
+    size: u64,
+    usage: wgpu::BufferUsages,
+) -> Option<wgpu::Buffer> {
     let scope = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
     let buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("Section buffer arena"),

@@ -133,8 +133,9 @@ fn supported(adapter: &wgpu::Adapter, device: &wgpu::Device) -> bool {
     let flags = adapter.get_downlevel_capabilities().flags;
     let limits = device.limits();
     flags.contains(wgpu::DownlevelFlags::VERTEX_STORAGE | wgpu::DownlevelFlags::COMPUTE_SHADERS)
-        && limits.max_storage_buffers_per_shader_stage >= 3
-        && limits.max_storage_buffer_binding_size >= super::arena::PAGE_BYTES
+        && limits.max_storage_buffers_per_shader_stage >= 5
+        && limits.max_storage_buffer_binding_size
+            >= 256 * std::mem::size_of::<crate::mesher::TerrainVertex>() as u64
 }
 
 fn storage(binding: u32, stage: wgpu::ShaderStages, read_only: bool) -> wgpu::BindGroupLayoutEntry {
@@ -290,7 +291,7 @@ impl Flat {
             ],
         });
         let module = crate::gfx::shader_module(
-            &device,
+            device,
             wgpu::ShaderModuleDescriptor {
                 label: Some("Flatten section draws"),
                 source: wgpu::ShaderSource::Wgsl(include_str!("flatten.wgsl").into()),
@@ -298,7 +299,7 @@ impl Flat {
         );
         let compute_pipeline = |layout: &wgpu::BindGroupLayout, entry| {
             crate::gfx::compute_pipeline(
-                &device,
+                device,
                 &wgpu::ComputePipelineDescriptor {
                     label: Some("Flatten section draws"),
                     layout: Some(

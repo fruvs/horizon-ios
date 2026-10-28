@@ -220,11 +220,20 @@ impl Game<'_> {
                 _ => None,
             })
         });
-        // A living mount at the default scale and camera distance.
+        // Camera.setup: the living mount's scale and camera distance
+        // attributes (the happy ghast's is 8, the default 4).
         let mount = self
             .riding
             .and_then(|id| self.mobs.iter().find(|m| m.id == id))
-            .map(|_| (1.0, 4.0));
+            .map(|m| {
+                let attribute = |name: &str, default: f64| {
+                    m.kind.attributes.get(name).copied().unwrap_or(default)
+                };
+                (
+                    attribute("minecraft:scale", 1.0) as f32,
+                    attribute("minecraft:camera_distance", 4.0),
+                )
+            });
         // AbstractBoat.positionRider turns a passenger by the boat's
         // deltaRotation after its yRotO was saved, and LocalPlayer.getViewYRot
         // interpolates a passenger's yaw: the boat's turn is spread over the
@@ -374,7 +383,15 @@ impl Game<'_> {
         m.head_pitch = pitch;
         let mut target = m.body_yaw;
         if dx * dx + dz * dz > 0.002_500_000_2 {
-            target = (dz.atan2(dx) as f32).to_degrees() - 90.0;
+            // LivingEntity.tick: walking backwards the body faces away from
+            // the walk direction, not along it.
+            let walk = (dz.atan2(dx) as f32).to_degrees() - 90.0;
+            let facing = (wrap(yaw) - walk).abs();
+            target = if 95.0 < facing && facing < 265.0 {
+                walk - 180.0
+            } else {
+                walk
+            };
         }
         if swinging {
             target = yaw;
@@ -445,7 +462,8 @@ impl Game<'_> {
         let packed = (u32::from(light >> 4) * 16) | ((u32::from(light & 15) * 16) << 8);
         let atlas = &self.gui.atlas;
         let lookup = |name: &str| atlas.sprites.get(name).map(|r| [r.u0, r.v0, r.u1, r.v1]);
-        horizon_client::mobs::render::render_with(
+        let start = out.len();
+        let items = horizon_client::mobs::render::render_with(
             m,
             alpha as f32,
             camera,
@@ -455,9 +473,28 @@ impl Game<'_> {
             &self.player_armor_layers(),
             out,
         );
-        self.player_elytra_geometry(m, camera, alpha as f32, packed, out);
+        for item in items {
+            self.mark_rendered_item(item.start, item.end, &item.item);
+        }
+        self.player_elytra_geometry(
+            m,
+            self.armor[1].as_ref().map(|s| &*s.item),
+            camera,
+            alpha as f32,
+            packed,
+            out,
+        );
         self.spin_attack_geometry(m, camera, alpha as f32, packed, out);
         self.held_item_geometry(m, camera, alpha, packed, true, out);
+        // LivingEntity.isCurrentlyGlowing: the Glowing effect. A server's client is
+        // in its team by its profile name.
+        if self.potions.effects.get("glowing").is_some() {
+            let team = match &self.remote {
+                Some(r) => self.score.board.players_team(&r.profile_name),
+                None => self.player_team(),
+            };
+            self.mark_outline(&out[start..], super::glowing::team_color(team));
+        }
     }
     /// `extractEntityInInventoryFollowsMouse`: the player in the box
     /// `[x0, x1) x [y0, y1)`, `size` pixels per block, turned toward the
@@ -501,7 +538,7 @@ impl Game<'_> {
         let atlas = &self.gui.atlas;
         let lookup = |name: &str| atlas.sprites.get(name).map(|r| [r.u0, r.v0, r.u1, r.v1]);
         let mut verts = Vec::new();
-        horizon_client::mobs::render::render_with(
+        let _ = horizon_client::mobs::render::render_with(
             &m,
             1.0,
             camera,
@@ -511,7 +548,14 @@ impl Game<'_> {
             &self.player_armor_layers(),
             &mut verts,
         );
-        self.player_elytra_geometry(&m, camera, 1.0, 240 | 240 << 8, &mut verts);
+        self.player_elytra_geometry(
+            &m,
+            self.armor[1].as_ref().map(|s| &*s.item),
+            camera,
+            1.0,
+            240 | 240 << 8,
+            &mut verts,
+        );
         self.held_item_geometry(&m, camera, 1.0, 240 | 240 << 8, false, &mut verts);
         let height = if m.extra.crouching { 1.5 } else { 1.8 };
         // PictureInPictureRenderer: the box centre, (size, size, -size);
@@ -550,17 +594,18 @@ impl Game<'_> {
 }
 
 impl Game<'_> {
-    fn player_elytra_geometry(
+    /// `WingsLayer` for a player wearing `chest`.
+    pub(super) fn player_elytra_geometry(
         &self,
         m: &Mob,
+        chest: Option<&str>,
         camera: glam::DVec3,
         partial: f32,
         light: u32,
         out: &mut Vec<horizon_client::mesher::Vertex>,
     ) {
-        let Some(asset) = self.armor[1]
-            .as_ref()
-            .and_then(|s| self.res.items().get(&s.item))
+        let Some(asset) = chest
+            .and_then(|item| self.res.items().get(item))
             .and_then(|i| i.equip_asset.as_ref())
         else {
             return;
@@ -578,6 +623,7 @@ impl Game<'_> {
         let base = horizon_client::mobs::render::base_transform(m, partial, camera)
             * glam::Mat4::from_translation(glam::Vec3::new(0.0, 0.0, 0.125));
         let angles = m.extra.elytra.angles(partial);
+        let start = out.len();
         horizon_client::mobs::render_model(
             model,
             base,
@@ -597,10 +643,13 @@ impl Game<'_> {
             0,
             out,
         );
+        if let Some(item) = chest {
+            self.mark_rendered_item(start, out.len(), item);
+        }
     }
     /// `SpinAttackEffectLayer`: Riptide's two boxes turning around a spinning
     /// player (`SpinAttackEffectModel.setupAnim`).
-    fn spin_attack_geometry(
+    pub(super) fn spin_attack_geometry(
         &self,
         m: &Mob,
         camera: glam::DVec3,
@@ -712,6 +761,8 @@ mod preview_tests {
                     color: u32::MAX,
                     light: 0,
                     normal: [0; 4],
+
+                    glint_uv: [0.0, 0.0],
                 })
         };
         // A shield and arm can intersect: neither average depth orders both ends.

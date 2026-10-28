@@ -159,7 +159,7 @@ impl PassTiming {
     ) {
         if self.marker.as_ref().is_none_or(|(f, _)| *f != format) {
             let module = crate::gfx::shader_module(
-                &device,
+                device,
                 wgpu::ShaderModuleDescriptor {
                     label: Some("Shader pack timing mark"),
                     source: wgpu::ShaderSource::Wgsl(super::timing::MARKER.into()),

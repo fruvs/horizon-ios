@@ -15,6 +15,14 @@ use horizon_shaders::{
 #[test]
 #[ignore = "needs HORIZON_TEST_SHADER_PACKS"]
 fn real_packs_read() {
+    let test_macros = || {
+        let mut macros = Macros::standard();
+        if std::env::var_os("HORIZON_TEST_SHADER_EXTENDED").is_some() {
+            macros.undef("MC_OS_MAC");
+            macros.define("MC_OS_OTHER", "");
+        }
+        macros
+    };
     let dir = std::env::var_os("HORIZON_TEST_SHADER_PACKS").expect("HORIZON_TEST_SHADER_PACKS");
     let dir = Path::new(&dir);
     let mut found = discover(dir);
@@ -27,11 +35,8 @@ fn real_packs_read() {
     for f in found.iter().filter(|f| f.problem.is_none()) {
         let start = Instant::now();
         let pack = Pack::open(&f.path).unwrap();
-        let macros = Macros::standard();
-        let shaders = Properties::parse(
-            &pack.read_text("shaders.properties").unwrap_or_default(),
-            &macros,
-        );
+        let macros = test_macros();
+        let shaders = Properties::from_pack(&pack, "", &macros);
         let ids: Vec<Properties> = ["block", "item", "entity", "dimension"]
             .iter()
             .filter_map(|n| pack.read_text(&format!("{n}.properties")))
@@ -162,6 +167,7 @@ fn real_packs_read() {
         for id in [0, -1, 1] {
             let start = std::time::Instant::now();
             let folder = dimension_folder(&pack, id);
+            let shaders = Properties::from_pack(&pack, &folder, &macros);
             // Vertex inputs like the game's (gfx/pack_post.rs writes the real ones).
             let terrain = horizon_shaders::GbuffersInputs {
                 declarations: "layout(location = 0) in vec3 hz_v_pos;".into(),
@@ -178,7 +184,7 @@ fn real_packs_read() {
                 weather: Some(terrain.clone()),
                 hand: Some(terrain),
             };
-            let post = load_post(&pack, &folder, &shaders, &Macros::standard(), &inputs);
+            let post = load_post(&pack, &folder, &shaders, &test_macros(), &inputs);
             println!(
                 "  dimension {id} (folder `{folder}`): {} post programs, shadow pass {} ({:?}, {:?}, {:?}, {:?}, {} shadowcomp), terrain {:?}, water {:?}, sky {:?} {:?}, entities {:?} {:?}, {} notes, {:.0} ms",
                 post.programs.len(),
@@ -197,6 +203,21 @@ fn real_packs_read() {
                 post.notes.len() + post.config.notes.len(),
                 start.elapsed().as_secs_f64() * 1000.0
             );
+            println!(
+                "    complete={}, images={}, textures={}, compute programs={}, compute notes={:?}",
+                post.complete,
+                post.images.len(),
+                post.textures.len(),
+                post.compute.programs.len(),
+                post.compute.notes
+            );
+            if std::env::var_os("HORIZON_TEST_SHADER_REQUIRE_COMPLETE").is_some() {
+                assert!(
+                    post.complete,
+                    "{} dimension {id}: {:?}, compute {:?}",
+                    f.name, post.notes, post.compute.notes
+                );
+            }
             let mut custom = post.custom;
             custom.eval(0.016, &|_| None);
             println!(

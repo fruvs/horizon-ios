@@ -38,7 +38,7 @@ impl MenuBlur {
     pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
         let format = format.remove_srgb_suffix();
         let shader = crate::gfx::shader_module(
-            &device,
+            device,
             wgpu::ShaderModuleDescriptor {
                 label: Some("Menu blur"),
                 source: wgpu::ShaderSource::Wgsl(include_str!("menu_blur.wgsl").into()),
@@ -81,7 +81,7 @@ impl MenuBlur {
             ..Default::default()
         });
         let pipeline = crate::gfx::render_pipeline(
-            &device,
+            device,
             &wgpu::RenderPipelineDescriptor {
                 label: Some("Menu blur pass"),
                 layout: Some(&pipeline_layout),

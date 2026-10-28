@@ -32,6 +32,8 @@ pub struct Diagnostic {
 
 #[derive(Debug, Default)]
 pub struct Preprocessed {
+    /// Effective macros after this stage and its live includes were processed.
+    pub macros: Macros,
     /// The code, one line per entry of `lines`.
     pub code: String,
     pub lines: Vec<Origin>,
@@ -70,6 +72,7 @@ pub fn preprocess(pack: &Pack, path: &str, macros: &Macros) -> Preprocessed {
         run.diagnose(Origin::default(), "`#if` without `#endif`");
     }
     run.out.code = run.code.join("\n");
+    run.out.macros = run.macros;
     run.out
 }
 

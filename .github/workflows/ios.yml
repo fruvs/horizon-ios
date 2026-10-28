@@ -49,6 +49,8 @@ jobs:
         # uses the same flags, so HORIZON_GAME_PREBUILT below finds this build.
         run: cargo build --release --locked --target "$IOS_TARGET" -p horizon-client --no-default-features --features audio
       - name: Bundle it
+        env:
+          HORIZON_MSA_CLIENT_ID: ${{ vars.HORIZON_MSA_CLIENT_ID }}
         run: |
           set -euo pipefail
           command -v xcodegen >/dev/null || brew install xcodegen
@@ -56,8 +58,18 @@ jobs:
           HORIZON_GAME_PREBUILT=1 xcodebuild -project packaging/ios/HorizonIOS.xcodeproj \
             -target HorizonGame -configuration Release -sdk iphoneos -arch arm64 \
             CODE_SIGNING_ALLOWED=NO CODE_SIGN_IDENTITY= CODE_SIGNING_REQUIRED=NO \
+            DEBUG_INFORMATION_FORMAT=dwarf \
             CONFIGURATION_BUILD_DIR="$PWD/build-ios" \
             build > xcode-game-build.log 2>&1 || { tail -60 xcode-game-build.log; exit 1; }
+          python3 - <<'PYCONFIG'
+          import os, plistlib
+          path = 'build-ios/HorizonGame.app/Info.plist'
+          with open(path, 'rb') as file:
+              info = plistlib.load(file)
+          info['HorizonMSAClientID'] = os.environ.get('HORIZON_MSA_CLIENT_ID', '')
+          with open(path, 'wb') as file:
+              plistlib.dump(info, file)
+          PYCONFIG
           rm -rf game-xcode && mkdir -p game-xcode/Payload
           cp -a build-ios/HorizonGame.app game-xcode/Payload/
           ( cd game-xcode && zip -qry ../Horizon-game-unsigned.ipa Payload )

@@ -65,9 +65,11 @@ horizon-dualsense = { path = "../horizon-dualsense", optional = true }
 # Controllers on iPhone and iPad (game/pad/ios.rs); an empty crate on every other target.
 horizon-gamecontroller = { path = "../horizon-gamecontroller" }
 # The game on an AirPlay display, the phone saying so; an empty crate on every other target.
+horizon-ios-launcher = { path = "../horizon-ios-launcher" }
 horizon-airplay = { path = "../horizon-airplay" }
 # HTTPS to the Minecraft services (online-mode session join).
 ureq = { version = "2", default-features = false, features = ["tls"] }
+unicode-bidi = "0.3.18"
 
 [target.'cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))'.dependencies]
 # The system clipboard, on the three targets arboard has a backend for (it has none for Android).

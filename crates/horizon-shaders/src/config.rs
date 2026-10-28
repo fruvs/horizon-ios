@@ -165,6 +165,8 @@ impl Default for Shadow {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Config {
+    /// `ambientOcclusionLevel`: the pack's terrain AO strength, from zero to one.
+    pub ambient_occlusion_level: f32,
     pub buffers: [Buffer; BUFFERS],
     pub shadow: Shadow,
     /// Conflicting or unreadable settings, as `file:line: message`.
@@ -178,6 +180,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            ambient_occlusion_level: 1.0,
             buffers: std::array::from_fn(|_| Buffer::default()),
             shadow: Shadow::default(),
             notes: Vec::new(),
@@ -244,6 +247,15 @@ impl Config {
     }
 
     fn constant(&mut self, place: &str, ty: &str, name: &str, value: &str) {
+        if ty == "float" && name == "ambientOcclusionLevel" {
+            match number(value).filter(|value| value.is_finite() && (0.0..=1.0).contains(value)) {
+                Some(value) => self.ambient_occlusion_level = value,
+                None => self.notes.push(format!(
+                    "{place}: ambientOcclusionLevel must be a finite float from 0 to 1"
+                )),
+            }
+            return;
+        }
         if self.shadow_constant(ty, name, value) {
             return;
         }
@@ -412,10 +424,39 @@ fn constants(text: &str) -> Vec<(usize, &str, &str, &str)> {
 
 /// Whether `text` declares a uniform sampler called `name`.
 fn declares(text: &str, name: &str) -> bool {
-    text.split(';').any(|decl| {
-        let words: Vec<&str> = decl.split_whitespace().collect();
-        words.first() == Some(&"uniform") && words.last() == Some(&name)
-    })
+    let tokens: Vec<_> = crate::macros::lex(text)
+        .into_iter()
+        .filter(|s| !s.trim().is_empty())
+        .collect();
+    for (i, token) in tokens.iter().enumerate() {
+        if *token != "uniform" {
+            continue;
+        }
+        let mut at = i + 1;
+        while tokens
+            .get(at)
+            .is_some_and(|s| matches!(*s, "lowp" | "mediump" | "highp"))
+        {
+            at += 1;
+        }
+        if !tokens.get(at).is_some_and(|ty| ty.contains("sampler")) {
+            continue;
+        }
+        at += 1;
+        loop {
+            if tokens.get(at) == Some(&name) {
+                return true;
+            }
+            while tokens.get(at).is_some_and(|s| !matches!(*s, "," | ";")) {
+                at += 1;
+            }
+            if tokens.get(at) != Some(&",") {
+                break;
+            }
+            at += 1;
+        }
+    }
+    false
 }
 
 fn code_line(code: &str, at: usize) -> usize {
@@ -461,6 +502,60 @@ mod tests {
         preprocess(&pack, "composite.fsh", &Macros::standard())
     }
 
+    #[test]
+    fn ambient_occlusion_strength_is_a_finite_unit_interval() {
+        assert_eq!(Config::default().ambient_occlusion_level, 1.0);
+        for value in ["0.0", "0.375", "1.0"] {
+            let mut config = Config::default();
+            config.read(&stage(&format!(
+                "const float ambientOcclusionLevel = {value};"
+            )));
+            assert_eq!(
+                config.ambient_occlusion_level,
+                value.parse::<f32>().unwrap()
+            );
+            assert!(config.notes.is_empty());
+        }
+        for value in ["-0.01", "1.01", "NaN", "inf"] {
+            let mut config = Config::default();
+            config.read(&stage(&format!(
+                "const float ambientOcclusionLevel = {value};"
+            )));
+            assert_eq!(config.ambient_occlusion_level, 1.0);
+            assert!(
+                config
+                    .notes
+                    .iter()
+                    .any(|note| note.contains("ambientOcclusionLevel")),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn comma_separated_depth_sampler_keeps_float_precision() {
+        for source in [
+            "uniform sampler2D gdepth,gcolor;",
+            "uniform highp sampler2D gcolor,gdepth;",
+            "uniform sampler2D gcolor, gdepth, gnormal;",
+        ] {
+            let mut config = Config::default();
+            config.read(&stage(source));
+            assert_eq!(
+                config.finish().buffers[1].format,
+                Format::parse("RGBA32F").unwrap()
+            );
+        }
+        for source in [
+            "uniform sampler2D gdepthOther;",
+            "uniform float gdepth;",
+            "// uniform sampler2D gdepth;\nvoid main(){}",
+        ] {
+            let mut config = Config::default();
+            config.read(&stage(source));
+            assert_eq!(config.finish().buffers[1].format, Format::RGBA8);
+        }
+    }
     #[test]
     fn formats_parse() {
         let f = |channels, bits, kind| {

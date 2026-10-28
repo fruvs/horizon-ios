@@ -3,7 +3,8 @@
 //! beside glass and leaves, back faces, cardinal shading and max(self, above)
 //! light.
 use super::{
-    Info, MeshTables, Padded, SectionMesh, TerrainVertex, lighting, pack_coords, pack_rgb, pi,
+    Info, MeshTables, Padded, QuadLighting, QuadState, SectionMesh, TerrainVertex, lighting,
+    pack_coords, pack_rgb, pi,
 };
 use horizon_core::{
     geometry::{Axis, Direction, VoxelShape, trig},
@@ -18,6 +19,19 @@ use std::{convert::Infallible, sync::OnceLock};
 /// `FluidRenderer.MAX_FLUID_HEIGHT`.
 const MAX_HEIGHT: f32 = 0.888_888_9;
 const EPSILON: f32 = 0.001;
+
+/// The `QuadLighting` of a fluid face from its vertex colours: `raw` is the
+/// fluid's tint at full brightness and `shaded` the colour the face is drawn
+/// with. Fluids have no AO. The emission bits in the alpha of both (lava)
+/// are dropped: the alpha here is 255.
+fn quad_lighting(raw: u32, shaded: u32) -> QuadLighting {
+    let opaque = |color: u32| color & 0x00FF_FFFF | 0xFF00_0000;
+    QuadLighting {
+        tint: opaque(raw),
+        shaded_tint: opaque(shaded),
+        no_directional: [opaque(raw); 4],
+    }
+}
 
 /// For the occlusion face toward `direction`: the height from the bottom over
 /// which its slice flush with the `direction` side covers the whole width
@@ -195,6 +209,7 @@ pub(super) fn tesselate(
     water_color: u32,
     out: &mut SectionMesh,
     [x, y, z]: [i32; 3],
+    state_id: u32,
 ) {
     use horizon_assets::model::Direction as D;
     let info = &tables.info;
@@ -302,17 +317,26 @@ pub(super) fn tesselate(
     } else {
         (tables.lava_still, tables.lava_flow, None)
     };
-    let target = if water {
-        &mut out.translucent
+    let (target, states) = if water {
+        (&mut out.translucent, &mut out.translucent_states)
     } else {
-        &mut out.solid
+        (&mut out.solid, &mut out.solid_states)
     };
+    // The block's own state and cell, also for the water of a waterlogged block.
+    let quad_state = QuadState::new(state_id, [x, y, z], true);
     let mut quad =
-        |v: [([f32; 3], [f32; 2]); 4], layer: u16, color: u32, light: u16, back: bool| {
-            let vertex = |(pos, uv)| TerrainVertex::new(pos, uv, layer, color, light);
+        |v: [([f32; 3], [f32; 2]); 4], layer: u16, shade: f32, light: u16, back: bool| {
+            let shaded = color(shade);
+            let vertex = |(pos, uv)| TerrainVertex::new(pos, uv, layer, shaded, light);
+            let state = QuadState {
+                lighting: Some(quad_lighting(color(1.0), shaded)),
+                ..quad_state
+            };
             target.extend(v.map(vertex));
+            states.push(state);
             if back {
                 target.extend([v[0], v[3], v[2], v[1]].map(vertex));
+                states.push(state);
             }
         };
     let (fx, fy, fz) = (x as f32, y as f32, z as f32);
@@ -360,7 +384,7 @@ pub(super) fn tesselate(
                 ([fx + 1.0, fy + ne, fz], uv[3]),
             ],
             layer,
-            color(lighting::cardinal(nether, D::Up)),
+            lighting::cardinal(nether, D::Up),
             light([x, y, z]),
             backward,
         );
@@ -375,7 +399,7 @@ pub(super) fn tesselate(
                 ([fx, y0, fz + 1.0], [0.0, 1.0]),
             ],
             still,
-            color(lighting::cardinal(nether, D::Down)),
+            lighting::cardinal(nether, D::Down),
             light([x, y - 1, z]),
             false,
         );
@@ -429,7 +453,7 @@ pub(super) fn tesselate(
                 ([x0, fy + bottom, z0], [0.0, 0.5]),
             ],
             layer,
-            color(up_shade * side),
+            up_shade * side,
             side_light,
             !is_overlay,
         );
@@ -464,5 +488,28 @@ mod tests {
         assert_eq!(coverage(&slab, Direction::South), 0.5);
         assert_eq!(coverage(&slab, Direction::Down), 1.0);
         assert_eq!(coverage(&slab, Direction::Up), 0.0);
+    }
+    #[test]
+    fn water_lighting_is_the_biome_tint_without_shade_or_emission_bits() {
+        // Water biome tint (63, 118, 228) and the same shaded by 0.5
+        // (31, 59, 114), both with the emission bits of level 9 in the alpha.
+        let raw = crate::mesher::emitting(pack_rgb([63, 118, 228]), 9);
+        let shaded = crate::mesher::emitting(pack_rgb([31, 59, 114]), 9);
+        assert_eq!((raw >> 24, shaded >> 24), (0xF6, 0xF6));
+        let l = quad_lighting(raw, shaded);
+        assert_eq!(l.tint, 0xFFE4_763F);
+        assert_eq!(l.shaded_tint, 0xFF72_3B1F);
+        // No AO and no directional shade apart from `shaded_tint`.
+        assert_eq!(l.no_directional, [0xFFE4_763F; 4]);
+    }
+    #[test]
+    fn lava_lighting_is_white_and_opaque_despite_full_emission() {
+        let white = crate::mesher::emitting(pack_rgb([255; 3]), 15);
+        let shaded = crate::mesher::emitting(pack_rgb([127; 3]), 15);
+        assert_eq!(white >> 24, 0xF0);
+        let l = quad_lighting(white, shaded);
+        assert_eq!(l.tint, 0xFFFF_FFFF);
+        assert_eq!(l.shaded_tint, 0xFF7F_7F7F);
+        assert_eq!(l.no_directional, [0xFFFF_FFFF; 4]);
     }
 }

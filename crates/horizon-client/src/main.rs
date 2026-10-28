@@ -65,8 +65,11 @@ fn main() {
     };
     if !help {
         logging::init(&home, thread);
+        // The log's first line names the build, so a bug report that carries the log says which one it was.
+        log::info!("Horizon {}", crash::version());
         crash::install(home.clone(), side);
         // The Microsoft account a last start kept (the title screen's face button), signed in again.
+        #[cfg(not(target_os = "ios"))]
         if side == "client" {
             horizon_client::msa::restore(&home);
         }

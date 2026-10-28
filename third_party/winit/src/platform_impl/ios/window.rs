@@ -197,10 +197,13 @@ impl Inner {
 
     pub fn inner_size(&self) -> PhysicalSize<u32> {
         let scale_factor = self.scale_factor();
-        let safe_area = self.safe_area_screen_space();
+        // The Metal layer and input events use the entire render view. Safe-area
+        // insets describe UI chrome, not a smaller drawable: using them here
+        // stretches a recreated surface and separates buttons from their hitboxes.
+        let bounds = self.view.bounds();
         let size = LogicalSize {
-            width: safe_area.size.width as f64,
-            height: safe_area.size.height as f64,
+            width: bounds.size.width as f64,
+            height: bounds.size.height as f64,
         };
         size.to_physical(scale_factor)
     }
@@ -560,12 +563,9 @@ impl Window {
         let scale_factor = scale_factor as f64;
         if scale_factor != 1.0 {
             let bounds = view.bounds();
-            let screen = window.screen();
-            let screen_space = screen.coordinateSpace();
-            let screen_frame = view.convertRect_toCoordinateSpace(bounds, &screen_space);
             let size = LogicalSize {
-                width: screen_frame.size.width as f64,
-                height: screen_frame.size.height as f64,
+                width: bounds.size.width as f64,
+                height: bounds.size.height as f64,
             };
             let window_id = RootWindowId(window.id());
             app_state::handle_nonuser_events(

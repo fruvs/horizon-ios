@@ -6,10 +6,59 @@ use crate::keyboard::{Key, KeyCode, KeyLocation, NamedKey, NativeKey, NativeKeyC
 pub(super) fn key_text(logical: &Key, text: &str) -> Option<smol_str::SmolStr> {
     (matches!(logical, Key::Character(_))
         && !text.is_empty()
+        && text_key_code(text).is_none()
         && !text
             .chars()
             .any(|c| c.is_control() || ('\u{f700}'..='\u{f8ff}').contains(&c)))
     .then(|| text.into())
+}
+
+/// `UIKeyInput::insertText:` is an independent input path: UIKit can send a
+/// navigation token here without delivering a `UIPress`. Decode the whole token
+/// before splitting real text into characters, so its name cannot become typing.
+pub(super) fn insert_text_keys(text: &str) -> Vec<(PhysicalKey, Key)> {
+    if let Some(code) = text_key_code(text) {
+        return vec![(
+            PhysicalKey::Code(code),
+            logical_key(PhysicalKey::Code(code), text),
+        )];
+    }
+    text.chars()
+        .filter_map(|c| {
+            let text = smol_str::SmolStr::from_iter([c]);
+            if let Some(code) = text_key_code(&text) {
+                let physical = PhysicalKey::Code(code);
+                Some((physical, logical_key(physical, &text)))
+            } else {
+                let logical = Key::Character(text.clone());
+                key_text(&logical, &text).map(|_| {
+                    (
+                        PhysicalKey::Unidentified(NativeKeyCode::Unidentified),
+                        logical,
+                    )
+                })
+            }
+        })
+        .collect()
+}
+
+fn text_key_code(text: &str) -> Option<KeyCode> {
+    Some(match text {
+        "UIKeyInputUpArrow" | "\u{f700}" => KeyCode::ArrowUp,
+        "UIKeyInputDownArrow" | "\u{f701}" => KeyCode::ArrowDown,
+        "UIKeyInputLeftArrow" | "\u{f702}" => KeyCode::ArrowLeft,
+        "UIKeyInputRightArrow" | "\u{f703}" => KeyCode::ArrowRight,
+        "UIKeyInputEscape" | "\u{1b}" => KeyCode::Escape,
+        "UIKeyInputTab" | "\t" => KeyCode::Tab,
+        "UIKeyInputHome" | "\u{f729}" => KeyCode::Home,
+        "UIKeyInputEnd" | "\u{f72b}" => KeyCode::End,
+        "UIKeyInputPageUp" | "\u{f72c}" => KeyCode::PageUp,
+        "UIKeyInputPageDown" | "\u{f72d}" => KeyCode::PageDown,
+        "\n" | "\r" => KeyCode::Enter,
+        "\u{8}" | "\u{7f}" => KeyCode::Backspace,
+        "\u{f728}" => KeyCode::Delete,
+        _ => return None,
+    })
 }
 
 pub(super) fn physical_key(usage: usize) -> PhysicalKey {
@@ -232,6 +281,72 @@ mod tests {
             Some(" ")
         );
     }
+    #[test]
+    fn insert_text_decodes_navigation_before_splitting_into_characters() {
+        for (text, code, named) in [
+            ("UIKeyInputUpArrow", KeyCode::ArrowUp, NamedKey::ArrowUp),
+            (
+                "UIKeyInputDownArrow",
+                KeyCode::ArrowDown,
+                NamedKey::ArrowDown,
+            ),
+            (
+                "UIKeyInputLeftArrow",
+                KeyCode::ArrowLeft,
+                NamedKey::ArrowLeft,
+            ),
+            (
+                "UIKeyInputRightArrow",
+                KeyCode::ArrowRight,
+                NamedKey::ArrowRight,
+            ),
+            ("UIKeyInputHome", KeyCode::Home, NamedKey::Home),
+            ("UIKeyInputEnd", KeyCode::End, NamedKey::End),
+            ("UIKeyInputPageUp", KeyCode::PageUp, NamedKey::PageUp),
+            ("UIKeyInputPageDown", KeyCode::PageDown, NamedKey::PageDown),
+            ("UIKeyInputEscape", KeyCode::Escape, NamedKey::Escape),
+            ("UIKeyInputTab", KeyCode::Tab, NamedKey::Tab),
+            ("\u{f700}", KeyCode::ArrowUp, NamedKey::ArrowUp),
+            ("\u{f701}", KeyCode::ArrowDown, NamedKey::ArrowDown),
+            ("\u{f702}", KeyCode::ArrowLeft, NamedKey::ArrowLeft),
+            ("\u{f703}", KeyCode::ArrowRight, NamedKey::ArrowRight),
+            ("\n", KeyCode::Enter, NamedKey::Enter),
+            ("\t", KeyCode::Tab, NamedKey::Tab),
+            ("\u{7f}", KeyCode::Backspace, NamedKey::Backspace),
+            ("\u{f728}", KeyCode::Delete, NamedKey::Delete),
+        ] {
+            // The exact conversion called by WinitView::handle_insert_text. One
+            // actionable key, no character events for the UIKit token's letters.
+            let keys = insert_text_keys(text);
+            assert_eq!(keys, vec![(PhysicalKey::Code(code), Key::Named(named))]);
+            assert_eq!(key_text(&keys[0].1, text), None);
+            // Also reject a token if a hardware keyboard reports an unexpected HID.
+            assert_eq!(key_text(&Key::Character(text.into()), text), None);
+        }
+    }
+
+    #[test]
+    fn insert_text_preserves_unicode_and_does_not_strip_token_substrings() {
+        for text in [
+            "Hello world",
+            "é日本語🦀",
+            "e\u{301}",
+            "say UIKeyInputUpArrow!",
+        ] {
+            let keys = insert_text_keys(text);
+            let typed: String = keys
+                .iter()
+                .filter_map(|(_, key)| match key {
+                    Key::Character(text) => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(typed, text);
+        }
+        assert!(insert_text_keys("").is_empty());
+        assert!(insert_text_keys("\u{0}\u{f8ff}").is_empty());
+    }
+
     #[test]
     fn layout_text_is_independent_of_gameplay_position() {
         let key = physical_key(4);

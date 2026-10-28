@@ -27,7 +27,6 @@ use horizon_client::{
 };
 use std::time::Instant;
 use winit::{
-    application::ApplicationHandler,
     dpi::PhysicalPosition,
     event::{DeviceId, ElementState, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent},
     event_loop::ActiveEventLoop,
@@ -915,6 +914,9 @@ impl Game<'_> {
     /// The focused field's box (GUI pixels), where the screen can say: a title screen's field or an options
     /// page's search box. `None` for the rest (chat, a sign), which the touch controls leave alone.
     pub(super) fn focused_field_rect(&self) -> Option<[f32; 4]> {
+        if self.dialog_open() {
+            return None;
+        }
         if self.screen == Screen::Options {
             return self.ui.options.focused_rect();
         }

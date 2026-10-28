@@ -97,6 +97,7 @@ pub fn inputs() -> horizon_shaders::GbuffersInputs {
             .collect(),
         after: String::new(),
         // Cutout, as vanilla's entity types mostly are (OQ-23): the loader's test at 0.1.
+        terrain_lighting: None,
         alpha_test: Some(horizon_shaders::AlphaTest {
             op: ">",
             reference: 0.1,
@@ -135,6 +136,7 @@ pub fn cloud_inputs() -> horizon_shaders::GbuffersInputs {
             .map(|&(n, v)| (n.to_owned(), v.to_owned()))
             .collect(),
         after: String::new(),
+        terrain_lighting: None,
         alpha_test: None,
     }
 }
@@ -270,7 +272,7 @@ impl PackEntities {
         (buffer, group)
     }
 
-    fn slot_buffer(
+    pub(super) fn slot_buffer(
         device: &wgpu::Device,
         layout: &wgpu::BindGroupLayout,
         slots: u64,
@@ -341,17 +343,7 @@ impl PackEntities {
             };
             let start = self.scratch.len() as u32;
             self.scratch.extend_from_slice(run);
-            let (entity_id, block_id) = match program {
-                BLOCK => (0, span.id),
-                _ => (span.id, 0),
-            };
-            let mut bytes = [0u8; SLOT as usize];
-            bytes[0..4].copy_from_slice(&(span.stage as i32).to_le_bytes());
-            bytes[4..8].copy_from_slice(&entity_id.to_le_bytes());
-            bytes[8..12].copy_from_slice(&block_id.to_le_bytes());
-            for (i, c) in entity_color(run[0].layer).iter().enumerate() {
-                bytes[16 + 4 * i..20 + 4 * i].copy_from_slice(&c.to_le_bytes());
-            }
+            let bytes = span.draw_bytes(entity_color(run[0].layer));
             self.uniforms.extend_from_slice(&bytes);
             self.uniforms
                 .resize(self.uniforms.len() + (self.stride - SLOT) as usize, 0);
@@ -405,12 +397,12 @@ pub(super) fn quad_indices(device: &wgpu::Device, quads: u32) -> wgpu::Buffer {
 }
 
 /// Whether a run holds only geometry a gbuffers program can draw from the shared atlas: no
-/// celestial body, cloud, beam, End portal or crack (overlay codes Horizon's entity shader
-/// draws in its own way; entity.wgsl).
+/// celestial body, cloud, beam, End portal, crack or energy swirl (overlay codes Horizon's entity
+/// shader draws in its own way; entity.wgsl).
 fn plain(run: &[Vertex]) -> bool {
     run.iter()
         .step_by(4)
-        .all(|v| !matches!(v.layer, 2 | 4 | 6 | 9 | 10 | 11 | 12))
+        .all(|v| !matches!(v.layer, 2 | 4 | 6 | 9 | 10 | 11 | 12 | 34))
 }
 
 /// The programs of entity runs, in the order they draw.

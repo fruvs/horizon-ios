@@ -85,15 +85,19 @@ impl Window {
 #[derive(Default)]
 struct Mouse { ignore_first: bool }
 impl Mouse { fn set_ignore_first_move(&mut self) { self.ignore_first = true; } }
+#[derive(Default)]
+struct SplitScreen { guest: bool }
 struct Remote;
 struct Game {
+    splitscreen: SplitScreen, left: bool, right: bool,
     focused: bool, agent_pointer: bool, window: Option<Window>, mouse: Mouse,
     captured: bool, title: Option<()>, screen: Screen, remote: Option<Remote>,
     mining: bool, lan_acting: Option<u32>, renderer: Option<Renderer>, cursor: (f32, f32),
 }
 impl Default for Game {
     fn default() -> Self {
-        Self { focused: true, agent_pointer: false, window: Some(Window::default()),
+        Self { splitscreen: SplitScreen::default(), left: false, right: false,
+            focused: true, agent_pointer: false, window: Some(Window::default()),
             mouse: Mouse::default(), captured: false, title: None,
             screen: Screen::Playing, remote: None, mining: false, lan_acting: None,
             renderer: None, cursor: (0.0, 0.0) }
@@ -191,7 +195,7 @@ fn main() {
             binary = folder / ("capture.exe" if os.name == "nt" else "capture")
             rust.write_text(fixture, encoding="utf-8")
             subprocess.run(["rustc", "--edition=2024", str(rust), "-o", str(binary)],
-                           check=True, capture_output=True, text=True, timeout=60)
+                           check=True, text=True, timeout=60)
             subprocess.run([str(binary)], check=True, capture_output=True, text=True, timeout=10)
 
 

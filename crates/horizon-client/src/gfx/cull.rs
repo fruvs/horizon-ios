@@ -241,7 +241,7 @@ impl Cull {
             ],
         });
         let module = crate::gfx::shader_module(
-            &device,
+            device,
             wgpu::ShaderModuleDescriptor {
                 label: Some("Section culling"),
                 source: wgpu::ShaderSource::Wgsl(source(depth_test).into()),
@@ -283,7 +283,7 @@ impl Cull {
             DepthTest::InShader => ("fs_box", &[][..], wgpu::CompareFunction::Always),
         };
         let pipeline = crate::gfx::render_pipeline(
-            &device,
+            device,
             &wgpu::RenderPipelineDescriptor {
                 label: Some("Section culling"),
                 layout: Some(&pipeline_layout),

@@ -119,14 +119,14 @@ impl ArmorStandAssets {
 impl Game<'_> {
     /// `HumanoidArmorLayer` for the player: (model, texture rect, colour) of
     /// each worn piece, head to feet.
-    pub(super) fn player_armor_layers(&self) -> Vec<(&Part, [f32; 4], u32)> {
+    pub(super) fn player_armor_layers(&self) -> Vec<(&Part, [f32; 4], u32, String)> {
         self.stack_armor_layers(&self.armor)
     }
     /// `HumanoidArmorLayer` for worn stacks (head to feet), trims included.
     pub(super) fn stack_armor_layers(
         &self,
         armor: &[Option<ItemStack>; 4],
-    ) -> Vec<(&Part, [f32; 4], u32)> {
+    ) -> Vec<(&Part, [f32; 4], u32, String)> {
         self.armor_layers(
             armor
                 .each_ref()
@@ -135,7 +135,7 @@ impl Game<'_> {
     }
     /// `HumanoidArmorLayer` for another player's model: the armour it wears
     /// (`extra.head` .. `extra.feet`).
-    pub(super) fn worn_armor_layers(&self, m: &Mob) -> Vec<(&Part, [f32; 4], u32)> {
+    pub(super) fn worn_armor_layers(&self, m: &Mob) -> Vec<(&Part, [f32; 4], u32, String)> {
         let e = &m.extra;
         self.armor_layers(
             [&e.head, &e.chest, &e.legs, &e.feet].map(|s| s.as_deref().map(|i| (i, None))),
@@ -146,7 +146,7 @@ impl Game<'_> {
     fn armor_layers(
         &self,
         worn: [Option<(&str, Option<&ItemStack>)>; 4],
-    ) -> Vec<(&Part, [f32; 4], u32)> {
+    ) -> Vec<(&Part, [f32; 4], u32, String)> {
         let assets = &self.armor_stand_assets;
         let mut out = Vec::new();
         for (item, layer) in worn
@@ -182,13 +182,24 @@ impl Game<'_> {
             let color = undyed.map_or(0xFFFF_FFFF, |c| {
                 0xFF00_0000 | (c & 0xFF) << 16 | (c & 0xFF00) | (c >> 16) & 0xFF
             });
-            out.push((part, [r.u0, r.v0, r.u1, r.v1], color));
+            out.push((part, [r.u0, r.v0, r.u1, r.v1], color, item.to_owned()));
             // EquipmentLayerRenderer: the trim layer over the armour.
             if let Some(r) = stack
                 .and_then(|s| assets.trim_texture(&asset, kind, s))
                 .and_then(|t| self.gui.atlas.sprites.get(&t.sprite()))
             {
-                out.push((part, [r.u0, r.v0, r.u1, r.v1], 0xFFFF_FFFF));
+                let material = stack
+                    .and_then(|s| s.extra.as_ref()?.trim.as_ref())
+                    .map(|(material, _)| material.as_ref())
+                    .unwrap_or("");
+                let (namespace, material) =
+                    material.split_once(':').unwrap_or(("minecraft", material));
+                out.push((
+                    part,
+                    [r.u0, r.v0, r.u1, r.v1],
+                    0xFFFF_FFFF,
+                    format!("{namespace}:trim_{material}"),
+                ));
             }
         }
         out
@@ -578,9 +589,6 @@ impl Game<'_> {
         };
         for a in &self.armor_stands {
             let entity_start = out.len();
-            if a.invisible {
-                continue;
-            }
             // ArmorStand.shouldRenderAtSqrDistance: 256 times the box's mean
             // edge (4 for a marker's empty box), whatever the entity distance.
             // LivingEntityRenderer grows the culling box by 0.5 for a dragon head.
@@ -627,21 +635,8 @@ impl Game<'_> {
                 * glam::Mat4::from_scale(glam::Vec3::new(-1.0, -1.0, 1.0))
                 * glam::Mat4::from_translation(glam::Vec3::new(0.0, -1.501, 0.0));
             let mut poses = Poses::new(model);
-            // ArmorStand.DEFAULT_*_POSE and ArmorStandModel part visibility.
-            let deg = |v: f32| v.to_radians();
-            for (name, rot) in [
-                ("left_arm", [-10.0, 0.0, -10.0]),
-                ("right_arm", [-15.0, 0.0, 10.0]),
-                ("left_leg", [-1.0, 0.0, -1.0]),
-                ("right_leg", [1.0, 0.0, 1.0]),
-            ] {
-                if poses.has(name) {
-                    let pose = poses.get(name);
-                    pose[3] = deg(rot[0]);
-                    pose[4] = deg(rot[1]);
-                    pose[5] = deg(rot[2]);
-                }
-            }
+            // ArmorStandModel.setupAnim: the stand's pose and part visibility.
+            apply_pose(&mut poses, &a.pose);
             // Item layers pose from the hidden arms too (`visible` only skips drawing).
             let posed = poses.clone();
             let mut hide = |name: &str| {
@@ -665,16 +660,20 @@ impl Game<'_> {
                 a.position.z.floor() as i32,
             );
             let packed = (u32::from(light >> 4) * 16) | ((u32::from(light & 15) * 16) << 8);
-            horizon_client::mobs::render::draw(
-                model,
-                base,
-                &poses,
-                wood,
-                0xFFFF_FFFF,
-                packed,
-                0,
-                out,
-            );
+            // LivingEntityRenderer.submit skips the base model when invisible, but
+            // shouldRenderLayers remains true: worn/held items still form server models.
+            if !a.invisible {
+                horizon_client::mobs::render::draw(
+                    model,
+                    base,
+                    &poses,
+                    wood,
+                    0xFFFF_FFFF,
+                    packed,
+                    0,
+                    out,
+                );
+            }
             self.armor_stand_items(a, model, base, &posed, packed, out);
             // HumanoidArmorLayer: head, chest, legs, feet.
             for (slot, layer) in [
@@ -711,7 +710,24 @@ impl Game<'_> {
                 let color = undyed.map_or(0xFFFF_FFFF, |c| {
                     0xFF00_0000 | (c & 0xFF) << 16 | (c & 0xFF00) | (c >> 16) & 0xFF
                 });
-                let layer_poses = Poses::new(part);
+                // ArmorStandRenderer's HumanoidArmorLayer: the armour glint
+                // when `stack.hasFoil()`, as on a living entity.
+                let item_glint = self
+                    .res
+                    .items()
+                    .enchantments
+                    .props
+                    .get(&stack.item)
+                    .is_some_and(|p| p.glint);
+                let overlay = if stack.has_foil(item_glint) {
+                    horizon_client::mobs::render::ARMOR_GLINT
+                } else {
+                    0
+                };
+                // ArmorStandArmorModel.setupAnim: the same pose as the stand.
+                let mut layer_poses = Poses::new(part);
+                apply_pose(&mut layer_poses, &a.pose);
+                let armor_start = out.len();
                 horizon_client::mobs::render::draw(
                     part,
                     base,
@@ -719,14 +735,16 @@ impl Game<'_> {
                     uv,
                     color,
                     packed,
-                    0,
+                    overlay,
                     out,
                 );
+                self.mark_rendered_item(armor_start, out.len(), &stack.item);
                 // EquipmentLayerRenderer: the trim layer over the armour.
                 if let Some(trim) = assets
                     .trim_texture(&asset, kind, stack)
                     .and_then(|t| uv_of(&t.sprite()))
                 {
+                    let trim_start = out.len();
                     horizon_client::mobs::render::draw(
                         part,
                         base,
@@ -734,12 +752,50 @@ impl Game<'_> {
                         trim,
                         0xFFFF_FFFF,
                         packed,
-                        0,
+                        overlay,
                         out,
                     );
+                    if let Some((material, _)) =
+                        stack.extra.as_ref().and_then(|extra| extra.trim.as_ref())
+                    {
+                        let (namespace, material) =
+                            material.split_once(':').unwrap_or(("minecraft", material));
+                        self.mark_rendered_item(
+                            trim_start,
+                            out.len(),
+                            &format!("{namespace}:trim_{material}"),
+                        );
+                    }
                 }
             }
             self.cull_entity_vertices(out, entity_start);
+        }
+    }
+}
+/// The `Pose` rotations on the parts of an armor stand model or its armor
+/// (`ArmorStandArmorModel.setupAnim`); the body also turns the sticks.
+fn apply_pose(poses: &mut Poses, pose: &[[f32; 3]; 6]) {
+    let parts: [&[&str]; 6] = [
+        &["head"],
+        &[
+            "body",
+            "right_body_stick",
+            "left_body_stick",
+            "shoulder_stick",
+        ],
+        &["left_arm"],
+        &["right_arm"],
+        &["left_leg"],
+        &["right_leg"],
+    ];
+    for (names, rotation) in parts.into_iter().zip(pose) {
+        for name in names {
+            if poses.has(name) {
+                let part = poses.get(name);
+                part[3] = rotation[0].to_radians();
+                part[4] = rotation[1].to_radians();
+                part[5] = rotation[2].to_radians();
+            }
         }
     }
 }
@@ -871,12 +927,14 @@ impl Game<'_> {
                     }
                 },
             };
+            let start = out.len();
             let mut sink = horizon_client::item_render::WorldSink {
                 out,
                 light,
                 lights: Some(horizon_client::block_entity_render::diffuse_lights(
                     self.dim == super::Dim::Nether,
                 )),
+                glint: self.glint(),
             };
             let profile = stack
                 .extra
@@ -893,6 +951,7 @@ impl Game<'_> {
                 &self.item_host(),
                 &mut sink,
             );
+            self.mark_rendered_item(start, out.len(), &stack.item);
             return;
         }
         // A head item that is not worn armour.

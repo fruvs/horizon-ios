@@ -33,6 +33,21 @@ pub struct PackInputs {
     /// `heldItemId`, `heldItemId2` (item.properties, 5.3) and `heldBlockLightValue(2)`.
     pub held_items: [i32; 2],
     pub held_light: [i32; 2],
+    /// Interpolated player head position, before the third-person camera offset.
+    pub eye_position: DVec3,
+    /// World-space head direction, independent of front/rear camera perspective.
+    pub player_look: Vec3,
+    pub elytra_flying: bool,
+    pub player_mood: f32,
+    /// Height of the dimension's cloud plane; NaN when the dimension has none.
+    pub cloud_height: f32,
+    /// `BossOverlay::should_create_world_fog`: a boss event asks for world fog (`heavyFog`).
+    pub heavy_fog: bool,
+    /// The End flash's centre in the sky's world axes (camera-centred, before the view), as
+    /// the sky draws it; zero outside the End. `endFlashPosition` turns it into view space.
+    pub end_flash_position: Vec3,
+    /// The End flash's interpolated intensity, 0 outside the End.
+    pub end_flash_intensity: f32,
 }
 
 /// One uniform's value: up to 16 floats or 3 integers.
@@ -102,6 +117,20 @@ fn put(out: &mut [u8], offset: usize, bytes: &[u8]) {
 pub const NAMES: &[&str] = &[
     "cameraPosition",
     "previousCameraPosition",
+    "cameraPositionInt",
+    "cameraPositionFract",
+    "previousCameraPositionInt",
+    "previousCameraPositionFract",
+    "eyePosition",
+    "relativeEyePosition",
+    "playerLookVector",
+    "isElytraFlying",
+    "playerMood",
+    "cloudHeight",
+    "lightningBoltPosition",
+    "heavyFog",
+    "endFlashPosition",
+    "endFlashIntensity",
     "eyeAltitude",
     "upPosition",
     "sunPosition",
@@ -170,7 +199,8 @@ pub struct FrameUniforms {
     start: std::time::Instant,
     last: Option<std::time::Instant>,
     frame: u32,
-    previous: Option<(Vec3, Mat4, Mat4)>,
+    previous: Option<(DVec3, Mat4, Mat4)>,
+    camera_origin: DVec3,
     wetness: f32,
     eye_smooth: [f32; 2],
     /// The pack's shadow settings (7.1).
@@ -186,6 +216,7 @@ impl Default for FrameUniforms {
             last: None,
             frame: 0,
             previous: None,
+            camera_origin: DVec3::ZERO,
             wetness: 0.0,
             eye_smooth: [0.0; 2],
             shadow: Shadow::default(),
@@ -269,30 +300,103 @@ pub fn shadow_camera(light: Vec3, camera: DVec3, shadow: &Shadow) -> (Mat4, Mat4
     (view, projection)
 }
 
+/// Extended camera uniform contract: public written API documentation only, not Iris code.
+/// https://shaders.properties/current/reference/uniforms/camera/
+/// Split BEFORE converting to f32, including negative positions (fraction stays in [0,1)).
+fn split_position(position: DVec3) -> ([i32; 3], Vec3) {
+    let integer = position.floor();
+    // A fraction just below 1 can round up during the f64 -> f32 conversion.
+    let fraction = (position - integer)
+        .as_vec3()
+        .min(Vec3::splat(f32::from_bits(1.0f32.to_bits() - 1)));
+    (integer.as_ivec3().to_array(), fraction)
+}
+
+/// Keep horizontal float coordinates near the origin. The public camera contract permits
+/// renderer-specific wrapping. Preserve the absolute coordinates for the split uniforms,
+/// and subtract the new origin from BOTH frames, including after a teleport.
+fn update_camera_origin(origin: &mut DVec3, camera: DVec3, previous: DVec3) {
+    for axis in [0, 2] {
+        if (camera[axis] - origin[axis]).abs() > 30_000.0
+            || (camera[axis] - previous[axis]).abs() > 1_000.0
+        {
+            origin[axis] = camera[axis].floor();
+        }
+    }
+}
+
+/// `lightningBoltPosition`: the player-space (camera-relative, world axes) position of a bolt
+/// the frame draws, with w = 1; all zero when none is drawn. Several bolts: the nearest to the
+/// camera. The subtraction runs in f64 so far-from-origin bolts keep their sub-block offset.
+fn lightning_bolt_position(bolts: &[super::lightning::Bolt], camera: DVec3) -> Vec4 {
+    bolts
+        .iter()
+        .map(|bolt| DVec3::from_array(bolt.at) - camera)
+        .min_by(|a, b| a.length_squared().total_cmp(&b.length_squared()))
+        .map_or(Vec4::ZERO, |d| d.as_vec3().extend(1.0))
+}
+
+/// `endFlashPosition`: the flash's sky-axis centre in view space, rotated by the same view
+/// matrix the sky is drawn with (the sun and moon above go through `to_view` the same way).
+fn end_flash_view_position(view: &Mat4, sky_position: Vec3) -> Vec3 {
+    view.transform_vector3(sky_position)
+}
+
 /// `value` moved toward `target` with a half-life of `half_life` seconds over `dt` (5.6).
 fn smooth(value: f32, target: f32, half_life: f32, dt: f32) -> f32 {
     target + (value - target) * 0.5f32.powf(dt / half_life)
 }
 
+/// Keep the pack projection sparse: packs reconstruct depth from its diagonal and final
+/// column. Camera bob belongs in model-view, preserving the world's P * bob * rotation.
+fn camera_matrices(
+    yaw: f32,
+    pitch: f32,
+    bob: Mat4,
+    fov_degrees: f32,
+    aspect: f32,
+    far: f32,
+) -> (Mat4, Mat4) {
+    let view = bob * crate::camera::view_matrix(yaw, pitch);
+    let projection = Mat4::perspective_rh_gl(fov_degrees.to_radians(), aspect, 0.05, far);
+    (view, projection)
+}
+
 impl FrameUniforms {
+    fn camera_history(
+        &mut self,
+        camera: DVec3,
+        view: Mat4,
+        projection: Mat4,
+    ) -> (DVec3, Mat4, Mat4) {
+        let previous = self.previous.unwrap_or((camera, view, projection));
+        self.previous = Some((camera, view, projection));
+        previous
+    }
+
     /// This frame's values for a render size of `size` pixels.
     pub fn update(&mut self, frame: &Frame, inputs: &PackInputs, size: [u32; 2]) {
         let now = std::time::Instant::now();
         let dt = self.last.map_or(0.0, |l| (now - l).as_secs_f32());
         self.last = Some(now);
         let aspect = size[0] as f32 / size[1].max(1) as f32;
-        let view = crate::camera::view_matrix(frame.yaw, frame.pitch);
-        let projection = Mat4::perspective_rh_gl(
-            frame.fov_degrees.to_radians(),
+        let (view, projection) = camera_matrices(
+            frame.yaw,
+            frame.pitch,
+            frame.bob,
+            frame.fov_degrees,
             aspect,
-            0.05,
             frame.depth_far,
-        ) * frame.bob;
-        let camera = frame.camera.as_vec3();
-        let (previous_camera, previous_view, previous_projection) =
-            self.previous
-                .unwrap_or((Vec3::ZERO, Mat4::ZERO, Mat4::ZERO));
-        self.previous = Some((camera, view, projection));
+        );
+        let (previous_absolute, previous_view, previous_projection) =
+            self.camera_history(frame.camera, view, projection);
+        update_camera_origin(&mut self.camera_origin, frame.camera, previous_absolute);
+        // Both frames use the SAME origin: changing origins must not create camera motion
+        // in temporal reprojection. Geometry and gbuffer matrices are camera-relative.
+        let camera = (frame.camera - self.camera_origin).as_vec3();
+        let previous_camera = (previous_absolute - self.camera_origin).as_vec3();
+        let (camera_int, camera_fract) = split_position(frame.camera);
+        let (previous_int, previous_fract) = split_position(previous_absolute);
 
         let to_view = |v: Vec3| view.transform_vector3(v);
         let sun_angle = (frame.sky.sun_angle / 360.0 + 0.25).rem_euclid(1.0);
@@ -331,12 +435,29 @@ impl FrameUniforms {
         let world_day = inputs.day_time.div_euclid(24000);
         let seconds = (now - self.start).as_secs_f32() % 3600.0;
 
+        let lightning = lightning_bolt_position(frame.lightning.bolts, frame.camera);
+        let end_flash = end_flash_view_position(&view, inputs.end_flash_position);
+
         let value = |name: &str| -> Value {
             let v3 = |v: Vec3| Value::f(&v.to_array());
             let m4 = |m: Mat4| Value::f(&m.to_cols_array());
             match name {
                 "cameraPosition" => v3(camera),
                 "previousCameraPosition" => v3(previous_camera),
+                "cameraPositionInt" => Value::i(&camera_int),
+                "cameraPositionFract" => v3(camera_fract),
+                "previousCameraPositionInt" => Value::i(&previous_int),
+                "previousCameraPositionFract" => v3(previous_fract),
+                "eyePosition" => v3((inputs.eye_position - self.camera_origin).as_vec3()),
+                "relativeEyePosition" => v3((frame.camera - inputs.eye_position).as_vec3()),
+                "playerLookVector" => v3(inputs.player_look),
+                "isElytraFlying" => Value::i(&[inputs.elytra_flying as i32]),
+                "playerMood" => Value::f(&[inputs.player_mood]),
+                "cloudHeight" => Value::f(&[inputs.cloud_height]),
+                "lightningBoltPosition" => Value::f(&lightning.to_array()),
+                "heavyFog" => Value::i(&[inputs.heavy_fog as i32]),
+                "endFlashPosition" => v3(end_flash),
+                "endFlashIntensity" => Value::f(&[inputs.end_flash_intensity]),
                 "eyeAltitude" => Value::f(&[frame.camera.y as f32]),
                 "upPosition" => v3(to_view(Vec3::new(0.0, 100.0, 0.0))),
                 "sunPosition" => v3(sun),
@@ -447,12 +568,21 @@ fn components(name: &str) -> usize {
     match name {
         "cameraPosition"
         | "previousCameraPosition"
+        | "cameraPositionInt"
+        | "cameraPositionFract"
+        | "previousCameraPositionInt"
+        | "previousCameraPositionFract"
+        | "eyePosition"
+        | "relativeEyePosition"
+        | "playerLookVector"
         | "upPosition"
         | "sunPosition"
         | "moonPosition"
         | "shadowLightPosition"
+        | "endFlashPosition"
         | "fogColor"
         | "skyColor" => 3,
+        "lightningBoltPosition" => 4,
         "eyeBrightness" | "eyeBrightnessSmooth" | "atlasSize" => 2,
         n if n.starts_with("gbuffer") || n.starts_with("shadow") && n != "shadowAngle" => 16,
         _ => 1,
@@ -468,6 +598,193 @@ pub fn index(name: &str) -> Option<usize> {
 mod tests {
     use super::*;
 
+    fn walking_bob(phase: f32) -> Mat4 {
+        Mat4::from_translation(Vec3::new(
+            phase.sin() * 0.08,
+            -phase.cos().abs() * 0.07,
+            0.0,
+        )) * Mat4::from_rotation_z(phase.sin() * 0.035)
+            * Mat4::from_rotation_x(phase.cos() * 0.025)
+    }
+
+    // The sparse inverse-projection calculation used by Solas ToNDC and Complementary
+    // ScreenToView: off-diagonal matrix elements are deliberately not read by those packs.
+    fn pack_screen_to_view(projection: Mat4, ndc: Vec3) -> Vec3 {
+        let inverse = projection.inverse();
+        let diagonal = Vec4::new(
+            inverse.x_axis.x,
+            inverse.y_axis.y,
+            inverse.z_axis.z,
+            inverse.z_axis.w,
+        );
+        let homogeneous = diagonal * Vec4::new(ndc.x, ndc.y, ndc.z, ndc.z) + inverse.w_axis;
+        homogeneous.truncate() / homogeneous.w
+    }
+
+    #[test]
+    fn bobbed_pack_matrices_preserve_native_geometry_and_pure_projection() {
+        let (yaw, pitch, fov, aspect, far) = (28.0, 17.0, 73.0_f32, 1.7, 512.0);
+        let native_projection = Mat4::perspective_rh_gl(fov.to_radians(), aspect, 0.05, far);
+        let rotation = crate::camera::view_matrix(yaw, pitch);
+        for bob in [
+            Mat4::IDENTITY,
+            walking_bob(0.4),
+            walking_bob(1.8),
+            walking_bob(3.2),
+        ] {
+            let (view, projection) = camera_matrices(yaw, pitch, bob, fov, aspect, far);
+            assert!(projection.abs_diff_eq(native_projection, 1e-6));
+            assert!((projection * view).abs_diff_eq(native_projection * bob * rotation, 1e-5));
+            assert!((view * view.inverse()).abs_diff_eq(Mat4::IDENTITY, 1e-5));
+            assert!((projection * projection.inverse()).abs_diff_eq(Mat4::IDENTITY, 1e-5));
+        }
+    }
+
+    #[test]
+    fn walking_bob_keeps_pack_depth_reconstruction_correct() {
+        let rotation = crate::camera::view_matrix(31.0, 12.0);
+        let points = [
+            Vec3::new(-1.0, 0.4, -4.0),
+            Vec3::new(4.0, -2.0, -40.0),
+            Vec3::new(-30.0, 10.0, -120.0),
+        ];
+        let mut old_split_error = 0.0_f32;
+        for bob in [
+            Mat4::IDENTITY,
+            walking_bob(0.4),
+            walking_bob(1.8),
+            walking_bob(3.2),
+        ] {
+            let (view, projection) = camera_matrices(31.0, 12.0, bob, 73.0, 1.7, 512.0);
+            for point in points {
+                let world = rotation.inverse().transform_point3(point);
+                let expected = view.transform_point3(world);
+                let clip = projection * expected.extend(1.0);
+                let ndc = clip.truncate() / clip.w;
+                let reconstructed = pack_screen_to_view(projection, ndc);
+                assert!(
+                    reconstructed.abs_diff_eq(expected, 0.03),
+                    "{reconstructed:?} != {expected:?}"
+                );
+                // Demonstrate that moving bob into projection, as before the repair, makes
+                // the packs' sparse formula disagree with the rotation-only view position.
+                let old_projection = projection * bob;
+                old_split_error =
+                    old_split_error.max(pack_screen_to_view(old_projection, ndc).distance(point));
+            }
+        }
+        assert!(
+            old_split_error > 0.5,
+            "regression fixture did not exercise the old split: {old_split_error}"
+        );
+    }
+
+    #[test]
+    fn previous_camera_matrices_reproject_successive_bobbed_frames() {
+        let mut uniforms = FrameUniforms::default();
+        let world_point = Vec3::new(2.0, 1.0, 20.0);
+        let mut expected_previous: Option<(DVec3, Mat4, Mat4)> = None;
+        for (index, phase) in [0.4, 0.8, 1.3].into_iter().enumerate() {
+            let camera = DVec3::new(index as f64 * 0.1, 0.0, index as f64 * 0.15);
+            let (view, projection) = camera_matrices(
+                3.0 + index as f32,
+                4.0,
+                walking_bob(phase),
+                73.0,
+                1.7,
+                512.0,
+            );
+            let previous = uniforms.camera_history(camera, view, projection);
+            let expected = expected_previous.unwrap_or((camera, view, projection));
+            assert_eq!(previous, expected);
+            let current_position = world_point - camera.as_vec3();
+            let clip = projection * view * current_position.extend(1.0);
+            let ndc = clip.truncate() / clip.w;
+            let current_view = pack_screen_to_view(projection, ndc);
+            let current_player = view.inverse().transform_point3(current_view);
+            let previous_player = current_player + (camera - previous.0).as_vec3();
+            let reprojected = previous.2 * previous.1 * previous_player.extend(1.0);
+            let reference =
+                previous.2 * previous.1 * (world_point - previous.0.as_vec3()).extend(1.0);
+            assert!(
+                (reprojected.truncate() / reprojected.w)
+                    .abs_diff_eq(reference.truncate() / reference.w, 0.002)
+            );
+            expected_previous = Some((camera, view, projection));
+        }
+    }
+
+    #[test]
+    fn camera_split_preserves_negative_and_distant_sub_block_positions() {
+        // f32 conversion before splitting loses these fractional blocks at world borders.
+        for position in [
+            DVec3::new(-0.25, -64.125, -30_000_000.75),
+            DVec3::new(30_000_000.125, 320.5, 0.0),
+        ] {
+            let (integer, fraction) = split_position(position);
+            assert!(fraction.cmpge(Vec3::ZERO).all());
+            assert!(fraction.cmplt(Vec3::ONE).all());
+            let reconstructed = DVec3::from_array(integer.map(f64::from)) + fraction.as_dvec3();
+            assert_eq!(position, reconstructed);
+        }
+        assert_eq!(split_position(DVec3::splat(-0.25)).0, [-1; 3]);
+        // Negative positions arbitrarily close to a block boundary must not round to 1.
+        let (integer, fraction) = split_position(DVec3::splat(-1e-12));
+        assert_eq!(integer, [-1; 3]);
+        assert!(fraction.cmplt(Vec3::ONE).all());
+    }
+
+    #[test]
+    fn rebasing_keeps_both_frames_in_the_same_coordinate_system() {
+        let mut origin = DVec3::ZERO;
+        let positions = [
+            DVec3::new(29_999.875, 70.25, -29_999.875),
+            DVec3::new(30_000.125, 70.5, -30_000.125),
+            // A teleport also rebases even when still inside the walking threshold.
+            DVec3::new(28_000.25, 64.0, -28_000.5),
+        ];
+        let mut previous = positions[0];
+        for camera in positions {
+            update_camera_origin(&mut origin, camera, previous);
+            let current_relative = (camera - origin).as_vec3();
+            let previous_relative = (previous - origin).as_vec3();
+            assert!(current_relative.abs().max_element() <= 30_000.0);
+            assert!(
+                (current_relative - previous_relative)
+                    .abs_diff_eq((camera - previous).as_vec3(), 1e-5)
+            );
+            // Absolute split history is unaffected by origin shifts.
+            let (integer, fraction) = split_position(previous);
+            assert_eq!(
+                DVec3::from_array(integer.map(f64::from)) + fraction.as_dvec3(),
+                previous
+            );
+            previous = camera;
+        }
+        assert_eq!(origin, DVec3::new(28_000.0, 0.0, -28_001.0));
+    }
+
+    #[test]
+    fn new_vector_uniforms_are_available_to_custom_expressions() {
+        for name in [
+            "cameraPositionInt",
+            "cameraPositionFract",
+            "previousCameraPositionInt",
+            "previousCameraPositionFract",
+            "eyePosition",
+            "relativeEyePosition",
+            "playerLookVector",
+        ] {
+            assert!(index(name).is_some(), "missing {name}");
+            assert_eq!(
+                components(name),
+                3,
+                "custom expression would truncate {name}"
+            );
+        }
+        assert_eq!(components("isElytraFlying"), 1);
+    }
+
     #[test]
     fn values_follow_the_declared_type() {
         let mut out = vec![0u8; 64];
@@ -479,6 +796,92 @@ mod tests {
         assert_eq!(i32::from_ne_bytes(out[16..20].try_into().unwrap()), 1);
         Value::f(&[1.0; 16]).write("mat4", &mut out, 60);
         assert_eq!(out[60..64], [0; 4], "a value past the block is dropped");
+    }
+
+    #[test]
+    fn lightning_position_is_zero_without_a_bolt_and_camera_relative_with_one() {
+        use crate::gfx::lightning::Bolt;
+        let camera = DVec3::new(8.5, 70.0, -5.5);
+        assert_eq!(lightning_bolt_position(&[], camera), Vec4::ZERO);
+        let bolt = |at: [f64; 3]| Bolt { at, seed: 1 };
+        // World axes (not view axes), relative to the camera, with w = 1.
+        assert_eq!(
+            lightning_bolt_position(&[bolt([10.0, 64.0, -5.0])], camera),
+            Vec4::new(1.5, -6.0, 0.5, 1.0)
+        );
+        // The nearest of several bolts, wherever it is in the list.
+        let near = bolt([8.5, 70.0, 4.5]);
+        let far = bolt([100.0, 70.0, 100.0]);
+        for bolts in [[near, far], [far, near]] {
+            assert_eq!(
+                lightning_bolt_position(&bolts, camera),
+                Vec4::new(0.0, 0.0, 10.0, 1.0)
+            );
+        }
+        // A bolt on the camera still reports itself: w, not xyz, says it exists.
+        assert_eq!(
+            lightning_bolt_position(&[bolt(camera.to_array())], camera),
+            Vec4::new(0.0, 0.0, 0.0, 1.0)
+        );
+        // Subtracting in f64 keeps a quarter block that f32 positions would lose.
+        let far_camera = DVec3::new(30_000_000.25, 70.0, 0.0);
+        assert_eq!(
+            lightning_bolt_position(&[bolt([30_000_000.5, 70.0, 0.0])], far_camera),
+            Vec4::new(0.25, 0.0, 0.0, 1.0)
+        );
+    }
+
+    #[test]
+    fn end_flash_position_is_in_view_space_and_the_new_uniforms_have_their_types() {
+        // Facing south (yaw 0, vanilla's +Z): a flash straight south is dead ahead (-Z in
+        // view space), one to the east is on the left, one overhead stays up.
+        let south = crate::camera::view_matrix(0.0, 0.0);
+        let at = |view: &Mat4, sky: Vec3| end_flash_view_position(view, sky);
+        let close = |a: Vec3, b: Vec3| assert!(a.abs_diff_eq(b, 1e-3), "{a} != {b}");
+        close(
+            at(&south, Vec3::new(0.0, 0.0, 100.0)),
+            Vec3::new(0.0, 0.0, -100.0),
+        );
+        close(
+            at(&south, Vec3::new(100.0, 0.0, 0.0)),
+            Vec3::new(-100.0, 0.0, 0.0),
+        );
+        close(
+            at(&south, Vec3::new(0.0, 100.0, 0.0)),
+            Vec3::new(0.0, 100.0, 0.0),
+        );
+        // Turning to face west puts a flash in the west ahead of the player.
+        let west = crate::camera::view_matrix(90.0, 0.0);
+        close(
+            at(&west, Vec3::new(-100.0, 0.0, 0.0)),
+            Vec3::new(0.0, 0.0, -100.0),
+        );
+        // Same rotation the sun's view-space position takes (`to_view`), nothing else.
+        let sky = Vec3::new(30.0, 60.0, -70.0);
+        assert_eq!(at(&west, sky), west.transform_vector3(sky));
+        // The default (no pack, or outside the End) is a zero flash.
+        let none = PackInputs::default();
+        assert_eq!(at(&west, none.end_flash_position), Vec3::ZERO);
+        assert_eq!(none.end_flash_intensity, 0.0);
+
+        for (name, count) in [
+            ("lightningBoltPosition", 4),
+            ("heavyFog", 1),
+            ("endFlashPosition", 3),
+            ("endFlashIntensity", 1),
+        ] {
+            assert!(index(name).is_some(), "missing {name}");
+            assert_eq!(components(name), count, "custom expressions see {name}");
+        }
+        // heavyFog is an int that also reads as a declared float or bool; the vec4 is whole.
+        let mut out = vec![0u8; 32];
+        Value::i(&[1]).write("float", &mut out, 0);
+        assert_eq!(f32::from_ne_bytes(out[0..4].try_into().unwrap()), 1.0);
+        Value::i(&[1]).write("bool", &mut out, 4);
+        assert_eq!(i32::from_ne_bytes(out[4..8].try_into().unwrap()), 1);
+        Value::f(&[1.5, -6.0, 0.5, 1.0]).write("vec4", &mut out, 16);
+        let w = f32::from_ne_bytes(out[28..32].try_into().unwrap());
+        assert_eq!(w, 1.0);
     }
 
     #[test]
