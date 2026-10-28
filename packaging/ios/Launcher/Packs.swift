@@ -141,9 +141,12 @@ final class PackStore: ObservableObject {
         }
     }
 
-    func remove(_ name: String, kind: PackKind) {
-        try? FileManager.default.removeItem(at: kind.folder.appendingPathComponent(name))
-        reloadInstalled()
+    func remove(_ name: String, kind: PackKind) -> String? {
+        do {
+            try FileManager.default.removeItem(at: kind.folder.appendingPathComponent(name))
+            reloadInstalled()
+            return nil
+        } catch { return error.localizedDescription }
     }
 
     private static func isFolder(_ url: URL) -> Bool {
@@ -178,12 +181,43 @@ final class PackChoices: ObservableObject {
     @Published private(set) var shaderStatus: String?
     @Published private(set) var shaderNotes: [String] = []
 
+    typealias Request = @MainActor (String) async -> [String: Any]
+    private let request: Request
+    private var locked = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+    @Published private(set) var issue: String?
+
+    init(request: @escaping Request = { await Bridge.send($0) }) { self.request = request }
+
+    private func acquire() async {
+        if !locked { locked = true; return }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+    private func release() {
+        if waiters.isEmpty { locked = false }
+        else { waiters.removeFirst().resume() }
+    }
+
     func load() async {
-        let options = await Bridge.send("options-get resourcePacks")
-        if let packs = ((options["options"] as? [String: Any])?["resourcePacks"] as? [String: Any])?["value"] as? [String] {
-            resourcePacks = packs
+        await acquire()
+        defer { release() }
+        issue = await reload()
+    }
+
+    private func readResources() async -> String? {
+        let answer = await request("options-get resourcePacks")
+        if let error = answer.error { return error }
+        guard let packs = ((answer["options"] as? [String: Any])?["resourcePacks"] as? [String: Any])?["value"] as? [String] else {
+            return "The active resource packs could not be read. Try again."
         }
-        let shaders = await Bridge.send("shader-pack list")
+        resourcePacks = packs
+        return nil
+    }
+
+    private func readShaders() async -> String? {
+        let shaders = await request("shader-pack list")
+        if let error = shaders.error { return error }
+        guard shaders.keys.contains("selected") else { return "The selected shader pack could not be read. Try again." }
         shaderPack = shaders["selected"] as? String
         shaderNotes = []
         shaderStatus = nil
@@ -197,31 +231,66 @@ final class PackChoices: ObservableObject {
                 shaderStatus = "Selected. Open a world to load this pack, then return here for its status."
             }
         }
+        return nil
+    }
+
+    private func reload() async -> String? {
+        let resources = await readResources()
+        let shaders = await readShaders()
+        return resources ?? shaders
     }
 
     func isOn(_ name: String, kind: PackKind) -> Bool {
         kind == .resource ? resourcePacks.contains("file/\(name)") : shaderPack == name
     }
 
-    /// Turn a pack on or off; the error to show, if any.
+    /// Each mutation reads the latest confirmed state while holding the queue lock. A second toggle
+    /// cannot derive its whole resource-pack list from the cache preceding the first write.
     func set(_ name: String, kind: PackKind, on: Bool) async -> String? {
+        await acquire()
+        defer { release() }
+        let error = await setLocked(name, kind: kind, on: on)
+        issue = error
+        return error
+    }
+
+    private func setLocked(_ name: String, kind: PackKind, on: Bool) async -> String? {
         let answer: [String: Any]
         switch kind {
         case .resource:
+            if let error = await readResources() { return error }
             var packs = resourcePacks.filter { $0 != "file/\(name)" }
-            if on {
-                packs.append("file/\(name)")
-            }
+            if on { packs.append("file/\(name)") }
             guard let data = try? JSONSerialization.data(withJSONObject: packs),
-                  let list = String(data: data, encoding: .utf8)
-            else { return "That pack name can't be saved." }
-            answer = await Bridge.send("options-set resourcePacks \(list)")
+                  let list = String(data: data, encoding: .utf8) else { return "That pack name can't be saved." }
+            answer = await request("options-set resourcePacks \(list)")
         case .shader:
-            answer = await Bridge.send(on ? "shader-pack \(name)" : "shader-pack off")
+            answer = await request(on ? "shader-pack \(name)" : "shader-pack off")
         }
-        await load()
-        return answer.error
+        if let error = answer.error { return error }
+        // Confirm the result before another mutation, or a deletion, can use it.
+        let error = kind == .resource ? await readResources() : await readShaders()
+        if let error { return error }
+        guard isOn(name, kind: kind) == on else { return "The pack change was not confirmed. Try again." }
+        return nil
     }
+
+    /// Hold the same lock through disable + confirmation + deletion. Failed/unknown disable state
+    /// leaves the file intact. The closure allows a focused test without changing real pack folders.
+    func remove(_ name: String, kind: PackKind, delete: () -> String?) async -> String? {
+        await acquire()
+        defer { release() }
+        let readError = kind == .resource ? await readResources() : await readShaders()
+        if let readError { issue = readError; return readError }
+        if isOn(name, kind: kind), let error = await setLocked(name, kind: kind, on: false) {
+            issue = error
+            return error
+        }
+        let error = delete()
+        issue = error
+        return error
+    }
+
 }
 
 // MARK: - The page
@@ -242,6 +311,9 @@ struct PacksPage: View {
             .pickerStyle(.segmented)
 
             installedSection
+            if let issue = choices.issue {
+                Label(issue, systemImage: "exclamationmark.triangle").font(.footnote).foregroundStyle(Theme.warn)
+            }
 
             if kind == .shader, let status = choices.shaderStatus {
                 Text(status).font(Theme.sans(12)).foregroundStyle(Theme.text)
@@ -310,8 +382,9 @@ struct PacksPage: View {
                             get: { choices.isOn(name, kind: kind) },
                             set: { on in
                                 Haptics.tap()
+                                let changedKind = kind
                                 Task {
-                                    if let error = await choices.set(name, kind: kind, on: on) {
+                                    if let error = await choices.set(name, kind: changedKind, on: on) {
                                         notice = error
                                     }
                                 }
@@ -325,11 +398,11 @@ struct PacksPage: View {
                     .frame(minHeight: 50)
                     .contextMenu {
                         Button(role: .destructive) {
+                            let deletedKind = kind
                             Task {
-                                if choices.isOn(name, kind: kind) {
-                                    _ = await choices.set(name, kind: kind, on: false)
-                                }
-                                store.remove(name, kind: kind)
+                                if let error = await choices.remove(name, kind: deletedKind, delete: {
+                                    store.remove(name, kind: deletedKind)
+                                }) { notice = error }
                             }
                         } label: { Label("Delete", systemImage: "trash") }
                     }

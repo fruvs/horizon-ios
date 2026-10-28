@@ -159,3 +159,66 @@ final class LauncherAsyncTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: shared), sentinel)
     }
 }
+
+@MainActor
+final class PackMutationTests: XCTestCase {
+    func testSimultaneousResourceTogglesMergeAfterFirstAcknowledgement() async {
+        var packs: [String] = []
+        var writes: [[String]] = []
+        var firstAck: CheckedContinuation<Void, Never>?
+        let choices = PackChoices(request: { line in
+            if line == "options-get resourcePacks" { return ["options": ["resourcePacks": ["value": packs]]] }
+            if line.hasPrefix("options-set resourcePacks ") {
+                let json = String(line.dropFirst("options-set resourcePacks ".count))
+                let next = (try? JSONSerialization.jsonObject(with: Data(json.utf8))) as? [String] ?? []
+                writes.append(next)
+                if writes.count == 1 { await withCheckedContinuation { firstAck = $0 } }
+                packs = next
+                return ["ok": true]
+            }
+            return ["selected": NSNull()]
+        })
+        let first = Task { await choices.set("a.zip", kind: .resource, on: true) }
+        while firstAck == nil { await Task.yield() }
+        let second = Task { await choices.set("b.zip", kind: .resource, on: true) }
+        for _ in 0..<10 { await Task.yield() }
+        XCTAssertEqual(writes.count, 1)
+        firstAck?.resume()
+        let firstError = await first.value; let secondError = await second.value
+        XCTAssertNil(firstError); XCTAssertNil(secondError)
+        XCTAssertEqual(writes, [["file/a.zip"], ["file/a.zip", "file/b.zip"]])
+        XCTAssertEqual(choices.resourcePacks, ["file/a.zip", "file/b.zip"])
+    }
+    func testActivePackDisableFailureLeavesFileUntouched() async {
+        var deleted = false
+        let choices = PackChoices(request: { line in
+            if line.hasPrefix("options-set") { return ["error": "Reload failed"] }
+            return ["options": ["resourcePacks": ["value": ["file/a.zip"]]]]
+        })
+        let error = await choices.remove("a.zip", kind: .resource, delete: { deleted = true; return nil })
+        XCTAssertEqual(error, "Reload failed")
+        XCTAssertFalse(deleted)
+        XCTAssertTrue(choices.isOn("a.zip", kind: .resource))
+    }
+    func testUnconfirmedDisableDoesNotDeleteFile() async {
+        var deleted = false
+        let choices = PackChoices(request: { line in
+            if line.hasPrefix("options-set") { return ["ok": true] }
+            return ["options": ["resourcePacks": ["value": ["file/a.zip"]]]]
+        })
+        let error = await choices.remove("a.zip", kind: .resource, delete: { deleted = true; return nil })
+        XCTAssertNotNil(error)
+        XCTAssertFalse(deleted)
+    }
+    func testDeletionRunsOnlyAfterConfirmedDisable() async {
+        var packs = ["file/a.zip"]
+        var events: [String] = []
+        let choices = PackChoices(request: { line in
+            if line.hasPrefix("options-set") { events.append("disable"); packs = []; return ["ok": true] }
+            return ["options": ["resourcePacks": ["value": packs]]]
+        })
+        let error = await choices.remove("a.zip", kind: .resource, delete: { events.append("delete"); XCTAssertTrue(packs.isEmpty); return nil })
+        XCTAssertNil(error)
+        XCTAssertEqual(events, ["disable", "delete"])
+    }
+}
