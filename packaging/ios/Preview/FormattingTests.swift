@@ -83,3 +83,79 @@ final class SettingsModelTests: XCTestCase {
         XCTAssertEqual(Set(options.keys), Set(GameOptions.groups.flatMap { $0.rows.map(\.key) }))
     }
 }
+
+@MainActor
+final class LauncherAsyncTests: XCTestCase {
+    private func hits(_ id: String) -> [String: Any] { ["hits": [["project_id": id, "title": id]]] }
+
+    func testOldPackSearchCannotOverwriteNewResults() async {
+        var pending: [String: CheckedContinuation<Any?, Never>] = [:]
+        let store = PackStore(fetch: { url in
+            let query = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first { $0.name == "query" }?.value ?? ""
+            return await withCheckedContinuation { pending[query] = $0 }
+        })
+        let old = Task { await store.search(.resource, query: "old") }
+        while pending["old"] == nil { await Task.yield() }
+        let new = Task { await store.search(.shader, query: "new") }
+        while pending["new"] == nil { await Task.yield() }
+        pending.removeValue(forKey: "new")?.resume(returning: hits("new"))
+        await new.value
+        pending.removeValue(forKey: "old")?.resume(returning: hits("old"))
+        await old.value
+        XCTAssertEqual(store.results.map(\.id), ["new"])
+        XCTAssertFalse(store.searching)
+        XCTAssertNil(store.failed)
+    }
+
+    func testOldPackFailureCannotEndNewSearchOrSetError() async {
+        var pending: [String: CheckedContinuation<Any?, Never>] = [:]
+        let store = PackStore(fetch: { url in
+            let query = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first { $0.name == "query" }?.value ?? ""
+            return await withCheckedContinuation { pending[query] = $0 }
+        })
+        let old = Task { await store.search(.resource, query: "old") }
+        while pending["old"] == nil { await Task.yield() }
+        let new = Task { await store.search(.shader, query: "new") }
+        while pending["new"] == nil { await Task.yield() }
+        pending.removeValue(forKey: "old")?.resume(returning: nil)
+        await old.value
+        XCTAssertTrue(store.searching)
+        XCTAssertNil(store.failed)
+        pending.removeValue(forKey: "new")?.resume(returning: hits("new"))
+        await new.value
+        XCTAssertEqual(store.results.map(\.id), ["new"])
+    }
+
+    func testDuplicatePackInstallDoesNotStartAnotherRequest() async {
+        var resume: CheckedContinuation<Any?, Never>?
+        let store = PackStore(fetch: { _ in await withCheckedContinuation { resume = $0 } })
+        let project = ModrinthProject(id: "test", title: "Test", summary: "", author: "", downloads: 0, icon: nil, gameVersions: [])
+        let first = Task { await store.install(project, kind: .resource, version: "26.3") }
+        while resume == nil { await Task.yield() }
+        if case .success = await store.install(project, kind: .resource, version: "26.3") { XCTFail("Duplicate install succeeded") }
+        XCTAssertNotNil(store.downloading[project.id])
+        resume?.resume(returning: [])
+        _ = await first.value
+        XCTAssertNil(store.downloading[project.id])
+    }
+
+    func testStaleGameFileCompletionDoesNotImportOrReplaceSharedArchive() async throws {
+        let shared = GameFolder.documents.appendingPathComponent("horizon-download.zip")
+        let previous = try? Data(contentsOf: shared)
+        let sentinel = Data("keep-current-download".utf8)
+        try sentinel.write(to: shared)
+        defer { if let previous { try? previous.write(to: shared) } else { try? FileManager.default.removeItem(at: shared) } }
+        let source = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try Data("stale-download".utf8).write(to: source)
+        let imported = expectation(description: "Stale completion must not import")
+        imported.isInverted = true
+        let model = GameFilesDownload(importArchive: { _ in imported.fulfill(); return ["ok": true] })
+        let session = URLSession(configuration: .ephemeral)
+        defer { session.invalidateAndCancel() }
+        let task = session.downloadTask(with: URL(string: "https://example.invalid/test.zip")!)
+        model.urlSession(session, downloadTask: task, didFinishDownloadingTo: source)
+        await fulfillment(of: [imported], timeout: 0.15)
+        XCTAssertEqual(model.state, .idle)
+        XCTAssertEqual(try Data(contentsOf: shared), sentinel)
+    }
+}

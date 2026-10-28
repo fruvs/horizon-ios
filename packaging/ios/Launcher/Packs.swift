@@ -40,11 +40,20 @@ final class PackStore: ObservableObject {
     @Published private(set) var downloading: [String: Double] = [:]
     @Published private(set) var installed: [PackKind: [String]] = [:]
 
+    typealias Fetch = @MainActor (URL) async -> Any?
+    private let fetch: Fetch
+    private var searchRevision: UInt64 = 0
+    init(fetch: @escaping Fetch = { await PackStore.get($0) }) { self.fetch = fetch }
+
     private static let api = "https://api.modrinth.com/v2"
 
     func search(_ kind: PackKind, query: String) async {
+        searchRevision &+= 1
+        let revision = searchRevision
         searching = true
-        defer { searching = false }
+        failed = nil
+        results = []
+        defer { if revision == searchRevision { searching = false } }
         var parts = URLComponents(string: "\(Self.api)/search")!
         parts.queryItems = [
             URLQueryItem(name: "query", value: query),
@@ -52,9 +61,10 @@ final class PackStore: ObservableObject {
             URLQueryItem(name: "index", value: query.isEmpty ? "downloads" : "relevance"),
             URLQueryItem(name: "limit", value: "30"),
         ]
-        guard let url = parts.url, let json = await Self.get(url) as? [String: Any],
-              let hits = json["hits"] as? [[String: Any]]
-        else {
+        guard let url = parts.url else { return }
+        let response = await fetch(url)
+        guard revision == searchRevision, !Task.isCancelled else { return }
+        guard let json = response as? [String: Any], let hits = json["hits"] as? [[String: Any]] else {
             failed = "Modrinth didn't answer. Check the connection and try again."
             return
         }
@@ -78,18 +88,20 @@ final class PackStore: ObservableObject {
 
     /// Download `project`'s file for `version` (the game's Minecraft version) into `kind`'s folder.
     func install(_ project: ModrinthProject, kind: PackKind, version: String) async -> Result<Installed, PackError> {
+        guard downloading[project.id] == nil else { return .failure(PackError("This pack is already downloading.")) }
         downloading[project.id] = 0
         defer { downloading[project.id] = nil }
-        let versions = await Self.get(URL(string: "\(Self.api)/project/\(project.id)/version")!) as? [[String: Any]] ?? []
+        let versions = await fetch(URL(string: "\(Self.api)/project/\(project.id)/version")!) as? [[String: Any]] ?? []
         // Newest first, as Modrinth lists them: one made for this Minecraft, else the newest of all.
         let fitting = versions.first { ($0["game_versions"] as? [String] ?? []).contains(version) }
         guard let chosen = fitting ?? versions.first,
               let files = chosen["files"] as? [[String: Any]],
               let file = files.first(where: { $0["primary"] as? Bool == true }) ?? files.first,
               let link = (file["url"] as? String).flatMap(URL.init(string:)),
+              link.scheme?.lowercased() == "https", link.host != nil,
               let name = file["filename"] as? String,
               // A file name from the network names a file here: no folders in it.
-              !name.contains("/"), !name.hasPrefix(".")
+              !name.isEmpty, !name.contains("/"), !name.contains("\\"), !name.hasPrefix("."), name.lowercased().hasSuffix(".zip")
         else {
             return .failure(PackError("\(project.title) has no file to download."))
         }
@@ -102,8 +114,14 @@ final class PackStore: ObservableObject {
             }
             try FileManager.default.createDirectory(at: kind.folder, withIntermediateDirectories: true)
             let destination = kind.folder.appendingPathComponent(name)
-            try? FileManager.default.removeItem(at: destination)
-            try FileManager.default.moveItem(at: temporary, to: destination)
+            if FileManager.default.fileExists(atPath: destination.path) {
+                var isDirectory: ObjCBool = false
+                _ = FileManager.default.fileExists(atPath: destination.path, isDirectory: &isDirectory)
+                guard !isDirectory.boolValue else { return .failure(PackError("A folder already uses this pack filename.")) }
+                _ = try FileManager.default.replaceItemAt(destination, withItemAt: temporary)
+            } else {
+                try FileManager.default.moveItem(at: temporary, to: destination)
+            }
             reloadInstalled()
             let made = (chosen["game_versions"] as? [String])?.last ?? "another version"
             let note = fitting == nil ? "It was made for Minecraft \(made), so it may not look right on \(version)." : nil
@@ -173,7 +191,7 @@ final class PackChoices: ObservableObject {
             if let runtime = shaders["runtime"] as? [String: Any],
                let programs = runtime["programs"] as? [String] {
                 shaderStatus = programs.isEmpty ? "No supported effects loaded. Normal rendering is active."
-                    : "Running \(programs.count) post-processing passes."
+                    : "Running \(programs.count) shader programs."
                 shaderNotes = runtime["notes"] as? [String] ?? []
             } else {
                 shaderStatus = "Selected. Open a world to load this pack, then return here for its status."
@@ -238,7 +256,7 @@ struct PacksPage: View {
                   text: $query, keyboard: .default)
                 .onSubmit { Task { await store.search(kind, query: query) } }
             if kind == .shader {
-                Text("Partial compatibility: supported post-processing passes run. Pack terrain, water, and shadow rendering are not supported yet; Iris/OptiFine packs may look different or fail to load.")
+                Text("Compatibility varies by pack and settings. Check the runtime notes for unsupported features or loading errors.")
                     .font(Theme.sans(11)).foregroundStyle(Theme.textFaint)
             }
             if let failed = store.failed {
@@ -330,12 +348,13 @@ struct PacksPage: View {
 
     private func download(_ project: ModrinthProject) async {
         Haptics.tap()
-        switch await store.install(project, kind: kind, version: link.version) {
+        let downloadedKind = kind
+        switch await store.install(project, kind: downloadedKind, version: link.version) {
         case let .success(installed):
             Haptics.done()
             let name = installed.file
             var said: String
-            if link.canList, let error = await choices.set(name, kind: kind, on: true) {
+            if link.canList, let error = await choices.set(name, kind: downloadedKind, on: true) {
                 said = "Downloaded \(name), but it couldn't be switched on: \(error)"
             } else {
                 said = link.canList ? "\(name) is downloaded and on." : "\(name) is downloaded. Switch it on in a moment."

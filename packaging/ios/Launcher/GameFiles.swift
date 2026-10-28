@@ -21,7 +21,15 @@ final class GameFilesDownload: NSObject, ObservableObject {
     @Published var link: String = UserDefaults.standard.string(forKey: "gameFilesLink") ?? ""
     @Published var token: String = Keychain.read() ?? ""
 
+    typealias ImportArchive = @MainActor (String) async -> [String: Any]
+    private let importArchive: ImportArchive
+    private var attempt = UUID()
     private var session: URLSession?
+
+    init(importArchive: @escaping ImportArchive = { await Bridge.send($0) }) {
+        self.importArchive = importArchive
+        super.init()
+    }
     private var background: UIBackgroundTaskIdentifier = .invalid
 
     var busy: Bool {
@@ -33,10 +41,12 @@ final class GameFilesDownload: NSObject, ObservableObject {
 
     /// Where a finished download waits for the importer; it consumes the file.
     private nonisolated static var destination: URL {
-        GameFolder.documents.appendingPathComponent("horizon-download.zip")
+        GameFolder.documents.appendingPathComponent("horizon-download-\(UUID().uuidString).zip")
     }
 
     func start() {
+        guard !busy else { return }
+        attempt = UUID()
         let text = link.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let url = URL(string: text), let scheme = url.scheme?.lowercased(),
               scheme == "https" || scheme == "http", url.host != nil
@@ -63,6 +73,7 @@ final class GameFilesDownload: NSObject, ObservableObject {
     }
 
     func cancel() {
+        attempt = UUID()
         session?.invalidateAndCancel()
         session = nil
         state = .idle
@@ -76,7 +87,12 @@ final class GameFilesDownload: NSObject, ObservableObject {
         }
     }
 
-    private func finished(_ outcome: Result<URL, Error>) async {
+    private func finished(_ outcome: Result<URL, Error>, from source: URLSession) async {
+        guard session === source else {
+            if case let .success(file) = outcome { try? FileManager.default.removeItem(at: file) }
+            return
+        }
+        let generation = attempt
         session?.finishTasksAndInvalidate()
         session = nil
         switch outcome {
@@ -85,7 +101,8 @@ final class GameFilesDownload: NSObject, ObservableObject {
             Haptics.failed()
         case let .success(file):
             state = .installing
-            let answer = await Bridge.send("import \(file.path)")
+            let answer = await importArchive("import \(file.path)")
+            guard generation == attempt else { return }
             if let error = answer.error {
                 state = .failed(error)
                 Haptics.failed()
@@ -140,14 +157,14 @@ extension GameFilesDownload: URLSessionDownloadDelegate {
                 outcome = .failure(error)
             }
         }
-        Task { @MainActor in await self.finished(outcome) }
+        Task { @MainActor in await self.finished(outcome, from: session) }
     }
 
     nonisolated func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
         guard let error else { return }
         Task { @MainActor in
             guard self.session === session else { return }
-            await self.finished(.failure(error))
+            await self.finished(.failure(error), from: session)
         }
     }
 }

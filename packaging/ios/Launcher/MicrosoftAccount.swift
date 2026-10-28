@@ -114,6 +114,7 @@ final class MicrosoftAccount: ObservableObject {
               let json = String(data: data, encoding: .utf8)
         else { return }
         let answer = await Bridge.send("launcher-session \(json)")
+        guard generation == attempt else { return }
         if let error = answer.error {
             state = .failed(error)
         }
