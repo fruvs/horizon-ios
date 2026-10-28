@@ -17,7 +17,10 @@ final class LauncherLayoutTests: XCTestCase {
     func testPhoneLayoutAndSignedInIdentity() {
         XCUIDevice.shared.orientation = .portrait
         let app = launch(signedIn: true)
-        XCTAssertTrue(app.staticTexts["Meadow Valley"].waitForExistence(timeout: 10))
+        XCTAssertFalse(app.staticTexts["Jump back in"].exists)
+        XCTAssertFalse(app.staticTexts["Meadow Valley"].exists)
+        XCTAssertFalse(app.buttons["launcher-nav-worlds"].exists)
+        XCTAssertFalse(app.buttons["launcher-nav-servers"].exists)
         let play = app.buttons["launcher-play-button"]
         XCTAssertTrue(play.isHittable)
         XCTAssertLessThanOrEqual(play.frame.maxX, app.frame.maxX)
@@ -27,11 +30,6 @@ final class LauncherLayoutTests: XCTestCase {
         XCTAssertTrue(app.staticTexts["Microsoft account"].firstMatch.waitForExistence(timeout: 5))
         XCTAssertFalse(app.buttons["Change Offline Name"].exists)
         app.buttons["Done"].tap()
-        if app.buttons["launcher-nav-worlds"].exists {
-            app.buttons["launcher-nav-worlds"].tap()
-            XCTAssertTrue(app.buttons["new-world-button"].waitForExistence(timeout: 5))
-            app.buttons["launcher-nav-play"].tap()
-        }
         let shot = XCTAttachment(screenshot: app.screenshot()); shot.name = "Native-launcher"; shot.lifetime = .keepAlways; add(shot)
     }
     func testOfflineNameEditing() {
@@ -44,23 +42,6 @@ final class LauncherLayoutTests: XCTestCase {
         alert.textFields.firstMatch.tap()
         alert.buttons["Cancel"].tap()
     }
-    func testWorldLibraryAndHardcoreOptions() {
-        XCUIDevice.shared.orientation = .portrait
-        let app = launch(signedIn: true)
-        if app.buttons["launcher-nav-worlds"].exists { app.buttons["launcher-nav-worlds"].tap() }
-        else { app.buttons["All Worlds"].tap() }
-        let newWorld = app.buttons["new-world-button"]
-        XCTAssertTrue(newWorld.waitForExistence(timeout: 5)); newWorld.tap()
-        let mode = app.descendants(matching: .any).matching(identifier: "creation-mode").firstMatch
-        XCTAssertTrue(mode.waitForExistence(timeout: 5)); mode.tap()
-        app.buttons["Hardcore"].tap()
-        XCTAssertFalse(app.descendants(matching: .any).matching(identifier: "creation-difficulty").firstMatch.isEnabled)
-        XCTAssertFalse(app.switches["creation-cheats"].isEnabled)
-        XCTAssertTrue(app.staticTexts["World generation"].exists)
-        XCTAssertTrue(app.buttons["creation-confirm"].isHittable)
-        app.buttons["Cancel"].tap()
-    }
-
     func testSettingsControlsLoadAndTogglePersistsAcrossNavigation() {
         let app = launch(signedIn: false)
         app.buttons["launcher-nav-settings"].tap()
@@ -128,12 +109,36 @@ final class LauncherLayoutTests: XCTestCase {
         XCTAssertTrue(dock.exists)
         XCTAssertGreaterThan(dock.frame.minX - app.frame.minX, 10)
         XCTAssertGreaterThan(app.frame.maxX - dock.frame.maxX, 10)
-        XCTAssertGreaterThan(app.frame.maxY - dock.frame.maxY, 24)
-        for page in ["worlds", "servers", "packs", "settings", "play"] {
+        let bottomClearance = app.frame.maxY - dock.frame.maxY
+        XCTAssertGreaterThan(bottomClearance, 24)
+        XCTAssertLessThan(bottomClearance, 50)
+        XCTAssertLessThanOrEqual(dock.frame.width, 281)
+        XCTAssertFalse(app.buttons["launcher-nav-worlds"].exists)
+        XCTAssertFalse(app.buttons["launcher-nav-servers"].exists)
+        XCTAssertFalse(app.staticTexts["All Worlds"].exists)
+        XCTAssertFalse(app.staticTexts["Jump back in"].exists)
+        for page in ["packs", "settings", "play"] {
             let button = app.buttons["launcher-nav-" + page]
             XCTAssertTrue(button.isHittable); button.tap()
             XCTAssertTrue(app.buttons["launcher-nav-" + page].isSelected)
         }
+    }
+
+    func testAccountControlIsCircularAndLibraryRoutesAreAbsent() {
+        let app = launch(signedIn: true)
+        let avatar = app.buttons["launcher-account-button"]
+        XCTAssertTrue(avatar.isHittable)
+        XCTAssertEqual(avatar.frame.width, avatar.frame.height, accuracy: 0.5)
+        XCTAssertGreaterThanOrEqual(avatar.frame.width, 44)
+        XCTAssertLessThanOrEqual(avatar.frame.width, 54)
+        XCTAssertFalse(app.buttons["launcher-nav-worlds"].exists)
+        XCTAssertFalse(app.buttons["launcher-nav-servers"].exists)
+        XCTAssertFalse(app.staticTexts["Jump back in"].exists)
+        XCTAssertFalse(app.staticTexts["All Worlds"].exists)
+        XCTAssertFalse(app.buttons["new-world-button"].exists)
+        avatar.tap()
+        XCTAssertTrue(app.staticTexts["Microsoft account"].firstMatch.waitForExistence(timeout: 5))
+        XCTAssertFalse(app.buttons["Change Offline Name"].exists)
     }
 
 }

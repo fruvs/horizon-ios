@@ -102,3 +102,19 @@ private struct FloatingNavigationMaterial: ViewModifier {
 extension View {
     func floatingNavigationGlass() -> some View { modifier(FloatingNavigationMaterial()) }
 }
+
+private struct AccountCircleMaterial: ViewModifier {
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @ViewBuilder func body(content: Content) -> some View {
+        if reduceTransparency {
+            content.background(Theme.surface, in: Circle()).overlay(Circle().strokeBorder(Theme.border))
+        } else if #available(iOS 26.0, *) {
+            content.glassEffect(.regular.interactive(), in: .circle)
+        } else {
+            content.background(.regularMaterial, in: Circle()).overlay(Circle().strokeBorder(Theme.border))
+        }
+    }
+}
+extension View {
+    func accountCircleGlass() -> some View { modifier(AccountCircleMaterial()) }
+}

@@ -13,21 +13,18 @@ struct HomeView: View {
     @State private var tab = Destination.play
     @Namespace private var dockSelection
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    private enum Sheet: String, Identifiable { case account, newWorld; var id: String { rawValue } }
-    @State private var sheet: Sheet?
+    @State private var showingAccount = false
     @State private var editingName = false
     @State private var nameDraft = ""
     @State private var nameRejected = false
 
     enum Destination: String, CaseIterable, Identifiable {
-        case play, worlds, servers, packs, settings
+        case play, packs, settings
         var id: Self { self }
         var title: String { rawValue.capitalized }
         var icon: String {
             switch self {
             case .play: return "play.circle"
-            case .worlds: return "square.grid.2x2"
-            case .servers: return "network"
             case .packs: return "shippingbox"
             case .settings: return "gearshape"
             }
@@ -76,27 +73,15 @@ struct HomeView: View {
                     .safeAreaInset(edge: .bottom, spacing: 0) {
                         floatingDock
                             .padding(.horizontal, 20)
-                            .padding(.top, 8)
-                            .padding(.bottom, 18)
+                            .padding(.top, 6)
+                            .padding(.bottom, 6)
                     }
 
             }
         }
         .background(Theme.background.ignoresSafeArea())
         .tint(Theme.accent)
-        .sheet(item: Binding<Sheet?>(
-            get: { sizeClass == .regular || sheet == .account ? sheet : nil },
-            set: { sheet = $0 }
-        )) { item in
-            switch item {
-            case .account: accountSheet
-            case .newWorld: newWorldSheet
-            }
-        }
-        .fullScreenCover(isPresented: Binding(
-            get: { sizeClass != .regular && sheet == .newWorld },
-            set: { if !$0 { sheet = nil } }
-        )) { newWorldSheet }
+        .sheet(isPresented: $showingAccount) { accountSheet }
         .alert("Offline player name", isPresented: $editingName) {
             TextField("Name", text: $nameDraft).textInputAutocapitalization(.never).autocorrectionDisabled()
             Button("Save") {
@@ -131,7 +116,7 @@ struct HomeView: View {
                         Text(item.title).font(.caption2.weight(tab == item ? .semibold : .medium)).lineLimit(1)
                     }
                     .foregroundStyle(tab == item ? Theme.accent : Theme.textMuted)
-                    .frame(maxWidth: .infinity, minHeight: 58)
+                    .frame(maxWidth: .infinity, minHeight: 52)
                     .background {
                         if tab == item {
                             Capsule().fill(Theme.accent.opacity(0.14))
@@ -146,8 +131,8 @@ struct HomeView: View {
                 .accessibilityIdentifier("launcher-nav-" + item.rawValue)
             }
         }
-        .padding(7)
-        .frame(maxWidth: 460)
+        .padding(6)
+        .frame(maxWidth: 280)
         .floatingNavigationGlass()
         .animation(reduceMotion ? nil : .spring(response: 0.35, dampingFraction: 0.8), value: tab)
         .accessibilityElement(children: .contain)
@@ -155,13 +140,25 @@ struct HomeView: View {
     }
 
     private func pageHeading(_ item: Destination) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("HORIZON\(item == .play ? " / JAVA EDITION" : "")")
-                .font(.caption2.weight(.semibold)).tracking(2).foregroundStyle(Theme.accent)
-            Text(item.title).font(.system(.largeTitle, design: .rounded).bold())
-            if item == .settings {
-                Text("Display, sound & the way you play").font(.subheadline).foregroundStyle(.secondary)
+        HStack(alignment: .center, spacing: 16) {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("HORIZON\(item == .play ? " / JAVA EDITION" : "")")
+                    .font(.caption2.weight(.semibold)).tracking(2).foregroundStyle(Theme.accent)
+                Text(item.title).font(.system(.largeTitle, design: .rounded).bold())
+                if item == .settings {
+                    Text("Display, sound & the way you play").font(.subheadline).foregroundStyle(.secondary)
+                }
             }
+            Spacer(minLength: 0)
+            Button { showingAccount = true } label: {
+                Avatar(name: shownName, face: head.face, size: 34)
+                    .frame(width: 48, height: 48)
+                    .accountCircleGlass()
+                    .contentShape(Circle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Account: \(shownName ?? "Not signed in")")
+            .accessibilityIdentifier("launcher-account-button")
         }
     }
 
@@ -179,8 +176,6 @@ struct HomeView: View {
                 pageHeading(item)
                 switch item {
                 case .play: home
-                case .worlds: WorldsSection(link: link, newWorld: { sheet = .newWorld })
-                case .servers: ServersPage(link: link, account: account)
                 case .packs: PacksPage(link: link)
                 case .settings:
                     VStack(spacing: 24) {
@@ -196,16 +191,6 @@ struct HomeView: View {
         .navigationTitle("")
         .navigationBarTitleDisplayMode(.inline)
         .toolbarBackground(.hidden, for: .navigationBar)
-        .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
-                Button { sheet = .account } label: {
-                    Avatar(name: shownName, face: head.face, size: 30)
-                        .frame(minWidth: 44, minHeight: 44)
-                }
-                .accessibilityLabel("Account: \(shownName ?? "Not signed in")")
-                .accessibilityIdentifier("launcher-account-button")
-            }
-        }
     }
 
     private func page<Content: View>(@ViewBuilder _ content: () -> Content) -> some View {
@@ -217,29 +202,13 @@ struct HomeView: View {
                 .frame(maxWidth: .infinity)
         }
         .background(Theme.background)
-        .refreshable { await link.reload() }
+        .refreshable { await link.refresh() }
     }
 
     private var home: some View {
         VStack(alignment: .leading, spacing: 28) {
             launchPanel
             if needsFiles { GameFilesCard(download: download, missing: true) }
-            ViewThatFits(in: .horizontal) {
-                HStack(alignment: .top, spacing: 28) {
-                    recentWorlds.frame(minWidth: 520, maxWidth: .infinity)
-                    VStack(spacing: 14) {
-                        quickLink("Multiplayer", detail: "Your saved servers", icon: "network", destination: .servers)
-                        quickLink("Personalize", detail: "Textures & shaders", icon: "square.stack.3d.up", destination: .packs)
-                    }.frame(width: 280).padding(.top, 56)
-                }
-                VStack(alignment: .leading, spacing: 24) {
-                    recentWorlds
-                    HStack(spacing: 14) {
-                        quickLink("Multiplayer", detail: "Saved servers", icon: "network", destination: .servers)
-                        quickLink("Personalize", detail: "Packs & shaders", icon: "square.stack.3d.up", destination: .packs)
-                    }
-                }
-            }
         }
     }
 
@@ -297,80 +266,10 @@ struct HomeView: View {
         .clipShape(RoundedRectangle(cornerRadius: 28))
     }
 
-    private var recentWorlds: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                Text("Jump back in").font(.title3.bold())
-                Spacer()
-                Button("All Worlds") { tab = .worlds }.font(.subheadline.weight(.medium)).frame(minHeight: 44)
-            }
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 16) {
-                    ForEach(Array(link.worlds.prefix(4).enumerated()), id: \.element.id) { index, world in
-                        Button { Task { await link.play(world) } } label: {
-                            VStack(alignment: .leading, spacing: 10) {
-                                ZStack(alignment: .bottomLeading) {
-                                    LauncherLandscape(index: index + 1, world: world)
-                                    LinearGradient(colors: [.clear, .black.opacity(0.4)], startPoint: .top, endPoint: .bottom)
-                                    HStack {
-                                        Label(world.mode.capitalized, systemImage: world.mode == "creative" ? "cube" : "leaf")
-                                            .font(.caption.weight(.medium))
-                                        Spacer()
-                                        Image(systemName: "play.circle.fill").font(.title2)
-                                    }.foregroundStyle(.white).padding(14)
-                                }
-                                .frame(height: 138).clipShape(RoundedRectangle(cornerRadius: 18))
-                                Text(world.name).font(.headline).foregroundStyle(.primary).lineLimit(1)
-                                Text(world.lastPlayed, style: .relative).font(.caption).foregroundStyle(.secondary)
-                            }.frame(width: sizeClass == .regular ? 260 : 230, alignment: .leading)
-                        }
-                        .buttonStyle(.plain).disabled(link.launching != nil)
-                    }
-                    Button { tab = .worlds } label: {
-                        VStack(spacing: 12) {
-                            Image(systemName: "plus.circle").font(.largeTitle.weight(.light))
-                            Text("Explore your worlds").font(.subheadline.weight(.medium))
-                        }
-                        .foregroundStyle(.secondary)
-                        .frame(width: link.worlds.isEmpty ? 280 : 180, height: 138)
-                        .background(Theme.surface, in: RoundedRectangle(cornerRadius: 18))
-                        .padding(.bottom, 52)
-                    }.buttonStyle(.plain)
-                }
-            }
-        }
-    }
-
-    private func quickLink(_ title: String, detail: String, icon: String, destination: Destination) -> some View {
-        Button { tab = destination } label: {
-            VStack(alignment: .leading, spacing: 18) {
-                HStack {
-                    Image(systemName: icon).font(.title2.weight(.medium))
-                        .frame(width: 44, height: 44)
-                        .foregroundStyle(Theme.accent).background(Theme.accent.opacity(0.10), in: RoundedRectangle(cornerRadius: 14))
-                    Spacer(minLength: 0)
-                    Image(systemName: "arrow.up.right").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
-                }
-                VStack(alignment: .leading, spacing: 5) {
-                    Text(title).font(.headline).foregroundStyle(.primary).lineLimit(1).minimumScaleFactor(0.85)
-                    Text(detail).font(.caption).foregroundStyle(.secondary)
-                }
-            }.padding(20).frame(maxWidth: .infinity, alignment: .leading)
-                .background(Theme.surface, in: RoundedRectangle(cornerRadius: 22))
-        }.buttonStyle(.plain)
-    }
-
     private var playLabel: String { link.launching ?? (needsFiles ? "Game files needed" : "Play") }
     private var needsFiles: Bool {
         if case .needsFiles = link.phase { return true }
         return link.phase == .waiting && !GameFolder.hasGameFiles
-    }
-
-    private var newWorldSheet: some View {
-        NewWorldSheet { settings in
-            sheet = nil
-            Task { await link.create(settings) }
-        }
     }
 
     private var accountSheet: some View {
@@ -391,7 +290,7 @@ struct HomeView: View {
             }
             .navigationTitle("Account")
             .navigationBarTitleDisplayMode(.inline)
-            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { sheet = nil } } }
+            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { showingAccount = false } } }
         }
         .presentationDetents([.medium, .large])
     }
@@ -411,7 +310,8 @@ struct Avatar: View {
             }
         }
         .frame(width: size, height: size)
-        .background(Theme.surfaceDisabled, in: RoundedRectangle(cornerRadius: size * 0.3))
+        .background(Theme.surfaceDisabled, in: Circle())
+        .clipShape(Circle())
         .accessibilityHidden(true)
     }
 }

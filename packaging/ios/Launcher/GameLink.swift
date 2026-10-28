@@ -122,11 +122,7 @@ final class GameLink: ObservableObject {
         if let version = state["version"] as? String {
             self.version = version
         }
-        if phase == .waiting, was != .waiting {
-            await reload()
-        }
         if phase == .title, was != .title {
-            await reload()
             if let action = queued {
                 queued = nil
                 await run(action)
