@@ -110,8 +110,11 @@ final class LauncherLayoutTests: XCTestCase {
         XCTAssertGreaterThan(dock.frame.minX - app.frame.minX, 10)
         XCTAssertGreaterThan(app.frame.maxX - dock.frame.maxX, 10)
         let bottomClearance = app.frame.maxY - dock.frame.maxY
-        XCTAssertGreaterThan(bottomClearance, 24)
-        XCTAssertLessThan(bottomClearance, 50)
+        XCTAssertEqual(bottomClearance, 22, accuracy: 2)
+        let measurement = XCTAttachment(string: "Dock frame: \(dock.frame); app frame: \(app.frame); bottom clearance: \(bottomClearance) points")
+        measurement.name = "Dock screen-edge measurement"; measurement.lifetime = .keepAlways; add(measurement)
+        let image = XCTAttachment(screenshot: app.screenshot())
+        image.name = "Lowered three-item navigation"; image.lifetime = .keepAlways; add(image)
         XCTAssertLessThanOrEqual(dock.frame.width, 281)
         XCTAssertFalse(app.buttons["launcher-nav-worlds"].exists)
         XCTAssertFalse(app.buttons["launcher-nav-servers"].exists)

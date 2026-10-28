@@ -68,14 +68,19 @@ struct HomeView: View {
                 }
                 .navigationSplitViewStyle(.balanced)
             } else {
-                NavigationStack { destination(tab) }
-                    .id(tab)
-                    .safeAreaInset(edge: .bottom, spacing: 0) {
-                        floatingDock
-                            .padding(.horizontal, 20)
-                            .padding(.top, 6)
-                            .padding(.bottom, 6)
-                    }
+                ZStack(alignment: .bottom) {
+                    NavigationStack { destination(tab) }
+                        .id(tab)
+                        // Keep the final scroll content above the floating control.
+                        .safeAreaInset(edge: .bottom, spacing: 0) {
+                            Color.clear.frame(height: 92).allowsHitTesting(false)
+                        }
+                    floatingDock
+                        .padding(.horizontal, 20)
+                        // Measured from the screen edge, not added to the home safe area.
+                        .padding(.bottom, 22)
+                }
+                .ignoresSafeArea(.container, edges: .bottom)
 
             }
         }
