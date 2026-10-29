@@ -238,7 +238,7 @@ impl Game<'_> {
             } else {
                 let mut scene = SceneCollisions {
                     world: &self.world,
-                    binding: self.collision,
+                    binding: &self.collision,
                     subject: None,
                 };
                 if r.free_flight(&mut scene) && r.angled {

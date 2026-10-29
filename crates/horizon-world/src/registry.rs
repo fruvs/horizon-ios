@@ -14,6 +14,7 @@ use std::{
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BlockStateId(pub u32);
 
+#[derive(PartialEq, Eq)]
 pub struct BlockRegistry {
     states: Vec<BlockState>,
     /// Ids by a hash of their state, checked against `states`: 12 bytes per
@@ -36,6 +37,22 @@ fn state_key(state: &BlockState) -> u64 {
     hasher.finish()
 }
 impl BlockRegistry {
+    /// Reuse immutable identities across client sessions instead of leaking a
+    /// duplicate registry at every startup. Equality includes IDs and defaults.
+    pub fn shared_static(self) -> &'static Self {
+        static REGISTRIES: std::sync::Mutex<Vec<&'static BlockRegistry>> =
+            std::sync::Mutex::new(Vec::new());
+        let mut registries = REGISTRIES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(registry) = registries.iter().find(|registry| ***registry == self) {
+            return registry;
+        }
+        let registry = Box::leak(Box::new(self));
+        registries.push(registry);
+        registry
+    }
+
     pub fn from_nbt(tag: &Tag) -> io::Result<Self> {
         if tag.get("DataVersion") != Some(&Tag::Int(DATA_VERSION)) {
             return Err(invalid("block registry DataVersion mismatch"));
@@ -281,5 +298,36 @@ impl<'r> BlockTableFile<'r> {
             read_checked: 2,
         }
         .checked(what)
+    }
+}
+
+#[cfg(test)]
+mod session_registry_tests {
+    use super::*;
+    fn registry(default: i64) -> BlockRegistry {
+        BlockRegistry::from_states(
+            vec![
+                BlockState {
+                    name: "test:block".into(),
+                    properties: BTreeMap::from([("variant".into(), "a".into())]),
+                },
+                BlockState {
+                    name: "test:block".into(),
+                    properties: BTreeMap::from([("variant".into(), "b".into())]),
+                },
+            ],
+            BTreeMap::from([("test:block".into(), default)]),
+        )
+        .unwrap()
+    }
+    #[test]
+    fn repeated_sessions_share_only_identical_registries() {
+        let first = registry(0).shared_static();
+        for _ in 0..20 {
+            assert!(std::ptr::eq(first, registry(0).shared_static()));
+        }
+        let changed = registry(1).shared_static();
+        assert!(!std::ptr::eq(first, changed));
+        assert_eq!(changed.default_state("test:block"), Some(BlockStateId(1)));
     }
 }

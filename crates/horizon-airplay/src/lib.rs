@@ -154,6 +154,7 @@ mod ios {
         /// The top and bottom halves, while split.
         halves: Option<(View, View)>,
         cover: Option<Cover>,
+        idle: Retained<UILabel>,
     }
 
     thread_local! {
@@ -218,6 +219,10 @@ mod ios {
         view.setBackgroundColor(Some(&UIColor::blackColor()));
         window.setRootViewController(Some(&controller));
         window.setHidden(false);
+        let idle = label(mtm, view.bounds(), "Game is not running", 28.0);
+        idle.setAutoresizingMask(flexible());
+        idle.setBackgroundColor(Some(&UIColor::blackColor()));
+        view.addSubview(&idle);
         STATE.with(|s| {
             *s.borrow_mut() = Some(State {
                 scene: scene.retain(),
@@ -228,6 +233,7 @@ mod ios {
                 },
                 halves: None,
                 cover: None,
+                idle,
             })
         });
     }
@@ -338,6 +344,11 @@ mod ios {
             if cover && state.cover.is_none() {
                 state.cover = cover_phone(MainThreadMarker::from(&*state.view.view));
             }
+            state.idle.setHidden(cover);
+            if !cover {
+                state.view.view.bringSubviewToFront(&state.idle);
+            }
+            let playing = cover;
             let cover = cover && !PHONE_GAME.with(Cell::get);
             if let Some(c) = &state.cover {
                 c.view.setHidden(!cover);
@@ -353,7 +364,7 @@ mod ios {
                 bottom.view.removeFromSuperview();
             }
             let view = state.halves.as_ref().map_or(&state.view, |(top, _)| top);
-            Some(screen_of(state, view))
+            playing.then(|| screen_of(state, view))
         })
     }
 

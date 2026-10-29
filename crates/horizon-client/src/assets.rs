@@ -178,7 +178,7 @@ impl Assets {
         // Chunks hold every state of this registry: content mods can take it
         // past vanilla's 16-bit global palette.
         crate::chunk::set_block_states(registry.len());
-        let registry: &'static BlockRegistry = Box::leak(Box::new(registry));
+        let registry = registry.shared_static();
         Ok(Self {
             registry,
             properties,

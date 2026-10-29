@@ -287,7 +287,7 @@ impl Game<'_> {
         let bounds = b.bounds();
         let mut scene = SceneCollisions {
             world: &self.world,
-            binding: self.collision,
+            binding: &self.collision,
             subject: None,
         };
         let wanted = target.subtract(good);

@@ -166,7 +166,7 @@ impl Game<'_> {
             }
             t.tick(
                 &self.world,
-                self.collision,
+                &self.collision,
                 &self.pack.assets,
                 self.res.facts(),
             )?;

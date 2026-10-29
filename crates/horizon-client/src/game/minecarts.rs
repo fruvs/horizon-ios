@@ -331,7 +331,7 @@ impl Game<'_> {
     fn move_cart(&self, c: &mut Minecart, delta: Vec3) {
         let mut scene = SceneCollisions {
             world: &self.world,
-            binding: self.collision,
+            binding: &self.collision,
             subject: None,
         };
         if let Ok(moved) = scene.resolve(c.bounds(), delta, 0.0, c.on_ground) {

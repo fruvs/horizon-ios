@@ -2,10 +2,15 @@ import AVFoundation
 
 /// The phone's audio session, for the game's sound (cpal's RemoteIO output, the `audio` feature): playback,
 /// so the game is heard with the ring/silent switch on as a game the player opened to play should be, mixed
-/// with whatever else is playing rather than stopping it. Set once the launcher loads; the game's stream is
-/// already open then, and takes the category at once.
+/// with whatever else is playing rather than stopping it. Activated when the game is shown and deactivated when its engine returns to idle.
 enum GameAudio {
     private static var observer: NSObjectProtocol?
+
+    static func stop() {
+        if let observer { NotificationCenter.default.removeObserver(observer) }
+        observer = nil
+        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+    }
 
     static func start() {
         let session = AVAudioSession.sharedInstance()

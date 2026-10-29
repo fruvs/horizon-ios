@@ -77,7 +77,7 @@ impl Game<'_> {
         };
         let mut scene = SceneCollisions {
             world: &self.world,
-            binding: self.collision,
+            binding: &self.collision,
             subject: None,
         };
         let Ok(shape) = self
@@ -98,7 +98,7 @@ impl Game<'_> {
         let sticky_top = if honey {
             let mut scene = SceneCollisions {
                 world: &self.world,
-                binding: self.collision,
+                binding: &self.collision,
                 subject: None,
             };
             self.collision
@@ -371,7 +371,7 @@ impl Game<'_> {
             pushed_movement(
                 SceneCollisions {
                     world: &self.world,
-                    binding: self.collision,
+                    binding: &self.collision,
                     subject: None,
                 },
                 self.border.geometry(),

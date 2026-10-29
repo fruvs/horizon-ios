@@ -1085,6 +1085,11 @@ fn on_off(on: bool) -> &'static str {
 }
 impl Renderer {
     /// Sections with GPU buffers, for soak tests watching residency.
+    /// Cancel pending shader builds and report when their worker has stopped.
+    pub fn shutdown_pack_compiler(&mut self) -> bool {
+        self.pack_compiler.shutdown()
+    }
+
     pub fn resident_sections(&self) -> usize {
         self.sections.len()
     }

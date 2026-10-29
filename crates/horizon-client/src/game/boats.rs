@@ -369,7 +369,7 @@ impl Game<'_> {
         let obstacles = self.boat_move_obstacles(&b);
         let mut scene = SceneCollisions {
             world: &self.world,
-            binding: self.collision,
+            binding: &self.collision,
             subject: None,
         };
         if b.old_status == Status::InAir && b.status != Status::InAir && b.status != Status::OnLand
@@ -727,7 +727,7 @@ impl Game<'_> {
         );
         let mut scene = SceneCollisions {
             world: &self.world,
-            binding: self.collision,
+            binding: &self.collision,
             subject: None,
         };
         if !scene.unobstructed(inner).unwrap_or(false) || self.boat_entity_collision(bb) {

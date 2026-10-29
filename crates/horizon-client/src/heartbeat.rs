@@ -12,6 +12,7 @@ use std::time::Duration;
 use horizon_telemetry::live::{self, Ping};
 
 /// A world is open to LAN or to friends.
+static ACTIVE: AtomicBool = AtomicBool::new(false);
 static LAN: AtomicBool = AtomicBool::new(false);
 static PINGER: OnceLock<Thread> = OnceLock::new();
 
@@ -20,7 +21,20 @@ const MAX_WAIT: Duration = Duration::from_secs(600);
 
 /// Starts the pings, once. Call when the game itself starts (not a dedicated server, not a
 /// benchmark or an automated run).
+pub fn stop() {
+    LAN.store(false, Ordering::Relaxed);
+    ACTIVE.store(false, Ordering::Relaxed);
+    if let Some(pinger) = PINGER.get() {
+        pinger.unpark();
+    }
+}
+
 pub fn start() {
+    ACTIVE.store(true, Ordering::Relaxed);
+    if let Some(pinger) = PINGER.get() {
+        pinger.unpark();
+        return;
+    }
     if PINGER.get().is_some() || std::env::var_os("HORIZON_NO_HEARTBEAT").is_some() {
         return;
     }
@@ -53,6 +67,10 @@ fn run(endpoint: &str) {
     let mut wait = live::INTERVAL;
     let mut failed = false;
     loop {
+        if !ACTIVE.load(Ordering::Relaxed) {
+            std::thread::park();
+            continue;
+        }
         let ping = Ping::new(&session, &version, LAN.load(Ordering::Relaxed));
         match live::send(endpoint, &ping) {
             Ok(()) => {

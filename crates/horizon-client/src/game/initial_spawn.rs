@@ -74,7 +74,7 @@ impl Game<'_> {
         Columns {
             world: &self.world,
             properties: &self.pack.assets.properties,
-            binding: self.collision,
+            binding: &self.collision,
         }
     }
     /// ChunkGenerator.getOrigin and getSpawnHeight of the overworld.
@@ -200,7 +200,7 @@ impl Game<'_> {
     fn collision_empty(&self, pos: [i32; 3]) -> bool {
         let mut scene = SceneCollisions {
             world: &self.world,
-            binding: self.collision,
+            binding: &self.collision,
             subject: None,
         };
         self.collision
@@ -327,7 +327,7 @@ impl Game<'_> {
         );
         let mut scene = SceneCollisions {
             world: &self.world,
-            binding: self.collision,
+            binding: &self.collision,
             subject: None,
         };
         no_collision_or_liquid(&mut scene, bounds)
