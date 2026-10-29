@@ -51,7 +51,6 @@ default = ["audio"]
 audio = ["horizon-client/audio"]
 # Named because game/ asks for them; gilrs and hidapi have no Android backend, and wasmtime's JIT is untested here.
 controllers = []
-mods = ["horizon-client/mods"]
 
 [patch.crates-io]
 wgpu-hal = { path = "../../third_party/wgpu-hal" }

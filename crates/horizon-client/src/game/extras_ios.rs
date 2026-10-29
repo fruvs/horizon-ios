@@ -155,21 +155,10 @@ impl Game<'_> {
         }
         Ok(())
     }
-    /// Native mods may request a map; WebAssembly requests apply only when
-    /// that runtime is built. The mobile built-in remains the fallback.
+    /// Native mods may request a map; the mobile built-in remains the fallback.
     fn minimap_wanted(&self) -> Option<NativeMinimap> {
         if let Some(map) = self.native_minimap_now() {
             return Some(map);
-        }
-        #[cfg(feature = "mods")]
-        if let Some(map) = self.mod_minimap() {
-            return Some(NativeMinimap {
-                corner: map.corner,
-                size: map.size,
-                blocks_per_pixel: map.blocks_per_pixel,
-                rotate: map.rotate,
-                round: map.round,
-            });
         }
         let e = &self.settings.extras;
         e.minimap.then_some(NativeMinimap {
@@ -252,13 +241,9 @@ impl Game<'_> {
         });
     }
     /// Mod zoom takes precedence; the built-in mobile zoom remains available.
-    /// Both mod helpers leave the spyglass's view alone.
+    /// The native helper leaves the spyglass's view alone.
     fn zoom_now(&self) -> (f32, bool, f64) {
         if let Some(zoom) = self.native_zoom_now() {
-            return (zoom.factor, zoom.smooth, f64::from(zoom.turn));
-        }
-        #[cfg(feature = "mods")]
-        if let Some(zoom) = self.mod_zoom() {
             return (zoom.factor, zoom.smooth, f64::from(zoom.turn));
         }
         let factor = self.extras.zoom.factor(self.scoping());
@@ -290,7 +275,6 @@ impl Game<'_> {
     /// the caller). The top left corner gives way to the debug screen.
     pub(super) fn draw_extras(&mut self, batch: &mut HudBatch) {
         let e = &self.settings.extras;
-        let mod_panels = self.mods.has_panels();
         let (fps_on, fps_corner, lows) = (e.fps, e.fps_corner, e.fps_lows);
         let (keys_on, keys_corner, cps_on) = (e.keystrokes, e.keystrokes_corner, e.keystrokes_cps);
         let map = self.minimap_shown();
@@ -341,9 +325,6 @@ impl Game<'_> {
                 cps,
             };
             extras_hud::draw_keystrokes(batch, &self.gui.atlas, &mut corners, keys_corner, &k);
-        }
-        if mod_panels {
-            self.draw_mod_panels(batch, &mut corners);
         }
         self.native_hud(batch, &mut corners);
     }
