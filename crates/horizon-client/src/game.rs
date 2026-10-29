@@ -15537,6 +15537,7 @@ impl App {
                     // Poll expensive workers to completion without blocking UIKit.
                     let mut stopped = shader_packs::shutdown_parser();
                     stopped &= game.shutdown_server_pack_worker();
+                    stopped &= world_loading::shutdown_preload();
                     if let Some(renderer) = &mut game.renderer {
                         stopped &= renderer.shutdown_pack_compiler();
                     }
@@ -15592,6 +15593,7 @@ impl App {
                         Ok(mut loading) => {
                             loading.window = game.window.clone();
                             *self = App::Loading(Box::new(loading));
+                            world_loading::release_world_data();
                             horizon_airplay::screen(false, false);
                         }
                         Err(error) => {
