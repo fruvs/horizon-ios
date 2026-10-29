@@ -192,4 +192,3 @@ class PruneBuildsTests(unittest.TestCase):
         self.assertIn("if: github.event_name == 'schedule'", step)
         self.assertIn("prune-builds --days 7", step)
         self.assertIn("GITHUB_STEP_SUMMARY", step)
-
