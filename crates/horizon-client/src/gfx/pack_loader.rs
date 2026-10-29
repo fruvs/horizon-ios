@@ -25,6 +25,7 @@ pub(super) struct Finished {
     pub notes: Vec<String>,
 }
 struct Running {
+    worker: Option<std::thread::JoinHandle<()>>,
     generation: u64,
     dimension: i32,
     result: mpsc::Receiver<Finished>,
@@ -46,6 +47,22 @@ fn failed(generation: u64, dimension: i32, message: String) -> Finished {
     }
 }
 impl Compiler {
+    pub fn shutdown(&mut self) -> bool {
+        self.cancel_queued();
+        if self.running.as_ref().is_some_and(|run| {
+            run.worker
+                .as_ref()
+                .is_some_and(|worker| !worker.is_finished())
+        }) {
+            return false;
+        }
+        if let Some(run) = self.running.take()
+            && let Some(worker) = run.worker
+        {
+            let _ = worker.join();
+        }
+        true
+    }
     pub fn submit(&mut self, request: Request) {
         if let Some(running) = &self.running {
             running.cancel.store(true, Ordering::Relaxed);
@@ -107,8 +124,9 @@ impl Compiler {
                     notes,
                 });
             }) {
-            Ok(_detached) => {
+            Ok(worker) => {
                 self.running = Some(Running {
+                    worker: Some(worker),
                     generation,
                     dimension,
                     result,
@@ -125,6 +143,13 @@ impl Compiler {
         }
     }
     pub fn poll(&mut self) -> Option<Finished> {
+        if self.running.as_ref().is_some_and(|run| {
+            run.worker
+                .as_ref()
+                .is_some_and(|worker| !worker.is_finished())
+        }) {
+            return None;
+        }
         if let Some(result) = self.failed.take() {
             return Some(result);
         }
@@ -158,6 +183,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn shutdown_waits_without_blocking_and_cancels_the_worker() {
+        let (release, wait) = mpsc::channel();
+        let (_send, result) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker = std::thread::spawn(move || {
+            wait.recv().unwrap();
+        });
+        let mut compiler = Compiler {
+            running: Some(Running {
+                worker: Some(worker),
+                generation: 1,
+                dimension: 0,
+                result,
+                cancel: cancel.clone(),
+            }),
+            queued: None,
+            failed: None,
+        };
+        assert!(!compiler.shutdown());
+        assert!(cancel.load(Ordering::Relaxed));
+        release.send(()).unwrap();
+        while !compiler
+            .running
+            .as_ref()
+            .unwrap()
+            .worker
+            .as_ref()
+            .unwrap()
+            .is_finished()
+        {
+            std::thread::yield_now();
+        }
+        assert!(compiler.shutdown());
+        assert!(compiler.running.is_none());
+        assert!(compiler.shutdown());
+    }
+    #[test]
     fn finished_shader_result_fits_main_thread_stack_budget() {
         let bytes = std::mem::size_of::<Finished>();
         assert!(
@@ -171,6 +233,7 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let mut compiler = Compiler {
             running: Some(Running {
+                worker: None,
                 generation: 4,
                 dimension: -1,
                 result,
@@ -196,6 +259,7 @@ mod tests {
         drop(send);
         let mut compiler = Compiler {
             running: Some(Running {
+                worker: None,
                 generation: 1,
                 dimension: 0,
                 result,

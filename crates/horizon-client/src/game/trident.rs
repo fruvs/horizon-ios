@@ -254,7 +254,7 @@ impl Game<'_> {
         );
         let mut scene = SceneCollisions {
             world: &self.world,
-            binding: self.collision,
+            binding: &self.collision,
             subject: None,
         };
         // ClipContext.Block.COLLIDER with Fluid.NONE.
@@ -335,7 +335,7 @@ impl Game<'_> {
             if let Some(bounds) = lift {
                 let mut scene = SceneCollisions {
                     world: &self.world,
-                    binding: self.collision,
+                    binding: &self.collision,
                     subject: None,
                 };
                 let up = Vec3::new(0.0, f64::from(1.1999999f32), 0.0);
@@ -543,7 +543,7 @@ impl Game<'_> {
                 } else {
                     let mut scene = SceneCollisions {
                         world: &self.world,
-                        binding: self.collision,
+                        binding: &self.collision,
                         subject: None,
                     };
                     if let Ok(moved) = scene.resolve(bounds(t.position), t.velocity, 0.0, false) {

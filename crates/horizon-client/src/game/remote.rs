@@ -3620,7 +3620,7 @@ impl Game<'_> {
                 player.velocity = delta;
             }
             None => {
-                let mut player = PlayerMotion::new(self.motion, position)?;
+                let mut player = PlayerMotion::new(&self.motion, position)?;
                 // Player.tick derives noPhysics from the current game mode.
                 player.spectator = self.spectator();
                 player.velocity = delta;
@@ -3850,8 +3850,8 @@ impl Game<'_> {
                 player,
                 scene: &mut self.world,
                 assets: &self.pack.assets,
-                collision_binding: self.collision,
-                resources: self.motion,
+                collision_binding: &self.collision,
+                resources: &self.motion,
             }
             .controlled_simulation_tick(keys)?;
         } else {
@@ -4261,7 +4261,7 @@ impl Game<'_> {
         // ItemEntity.tick runs on a client too: gravity, collisions and
         // friction move the item between the server's updates (every 20
         // ticks), and only the server removes it.
-        let (world, facts, collision) = (&self.world, self.res.facts(), self.collision);
+        let (world, facts, collision) = (&self.world, self.res.facts(), &self.collision);
         for d in self.dropped.iter_mut().filter(|_| running) {
             d.tick(world, facts, collision, false, &self.res.motion().fluids);
         }

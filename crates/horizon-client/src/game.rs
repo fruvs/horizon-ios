@@ -1190,8 +1190,8 @@ struct WorldCore {
     facts: BlockFacts,
     biomes: Arc<Biomes>,
     environment: Environment,
-    collision: BlockCollisionRegistry<'static>,
-    motion: MotionResources,
+    collision: Arc<BlockCollisionRegistry<'static>>,
+    motion: Arc<MotionResources>,
     threads: usize,
 }
 
@@ -1409,13 +1409,15 @@ fn select_creative_tab(
 }
 
 struct Game<'a> {
-    /// Shared with an integrated server; `collision` and `motion` borrow from it.
+    /// Shared with an integrated server; collision and motion tables are independently reference counted.
     res: Arc<Resources>,
-    /// Constructor borrow shared by the host and its optional second client.
-    resource_source: &'a Arc<Resources>,
+    /// Owned shared resources for constructing the optional second client.
+    resource_source: Arc<Resources>,
+    _lifetime: std::marker::PhantomData<&'a ()>,
     rest_loader: Option<WorldRestLoader>,
     pending_entry: Option<PendingWorldEntry>,
     world_loader: Option<world_loading::WorldLoader>,
+    quit_to_launcher: bool,
     pending_pack_reload: bool,
     local_pack_reload:
         Option<std::thread::JoinHandle<std::result::Result<packs::StagedPack, String>>>,
@@ -1425,8 +1427,8 @@ struct Game<'a> {
     link_prompt: Option<String>,
     dialogs: dialogs::DialogState,
     world_renderer_ready: bool,
-    collision: &'a BlockCollisionRegistry<'a>,
-    motion: &'a MotionResources,
+    collision: Arc<BlockCollisionRegistry<'static>>,
+    motion: Arc<MotionResources>,
     /// This game's resource packs (`reload_packs` replaces them).
     pack: PackResources,
     /// The title and menu bundle (GUI atlas, font and panorama).
@@ -2693,7 +2695,7 @@ impl Game<'_> {
             }
             // ItemEntity.tick's noPhysics (servers only): out of a block
             // placed on it, towards the closest open side (#1252).
-            let no_physics = merging && item.inside_block(&self.world, self.collision);
+            let no_physics = merging && item.inside_block(&self.world, &self.collision);
             if no_physics {
                 let speed = self.world.random.next_float() * 0.2 + 0.1;
                 item.move_towards_closest_space(&self.world, self.res.facts(), speed);
@@ -2701,7 +2703,7 @@ impl Game<'_> {
             let alive = item.tick(
                 &self.world,
                 self.res.facts(),
-                self.collision,
+                &self.collision,
                 no_physics,
                 &self.res.motion().fluids,
             );
@@ -2710,7 +2712,7 @@ impl Game<'_> {
                 &self.world,
                 self.pack.assets.registry,
                 self.res.facts(),
-                self.collision,
+                &self.collision,
                 item.bounds(),
                 &mut item.velocity,
             );
@@ -2940,7 +2942,7 @@ impl Game<'_> {
             projectiles: &self.creatures.projectiles,
             world: &mut self.world,
             facts: self.res.facts(),
-            collision: self.collision,
+            collision: &self.collision,
             events: &mut self.level_events,
             dimension,
             darken,
@@ -3831,7 +3833,7 @@ impl Game<'_> {
         }
         let mut scene = collisions::SceneCollisions {
             world: &self.world,
-            binding: self.collision,
+            binding: &self.collision,
             subject: Some(collisions::PowderSnowSubject {
                 fall_distance: f.fall_distance,
                 falling_block: true,
@@ -4976,7 +4978,7 @@ impl Game<'_> {
                 Vec3::new(s.x, y.max(s.y), s.z)
             }
         };
-        let mut player = PlayerMotion::new(self.motion, feet)?;
+        let mut player = PlayerMotion::new(&self.motion, feet)?;
         player.yaw = self.yaw;
         player.load_saved_state_once(&mut self.restore_player_state, &self.level)?;
         let spectator = self.mode == horizon_client::command::args::GameMode::Spectator;
@@ -5145,8 +5147,8 @@ impl Game<'_> {
                 player,
                 scene: &mut self.world,
                 assets: &self.pack.assets,
-                collision_binding: self.collision,
-                resources: self.motion,
+                collision_binding: &self.collision,
+                resources: &self.motion,
             }
             .controlled_simulation_tick(keys)?;
             // Player.jumpFromGround: the jump statistic.
@@ -10279,7 +10281,7 @@ impl Game<'_> {
             o.tick(
                 &self.world,
                 self.res.facts(),
-                self.collision,
+                &self.collision,
                 target,
                 &mut next_float,
             )
@@ -13020,7 +13022,9 @@ impl Game<'_> {
                         Action::Quit => {
                             if self.splitscreen.guest {
                                 self.leave_server(None)?;
-                            } else if !horizon_ios_launcher::show() {
+                            } else if horizon_ios_launcher::show() {
+                                self.quit_to_launcher = true;
+                            } else {
                                 event_loop.exit();
                             }
                         }
@@ -13766,7 +13770,7 @@ impl<'a> Game<'a> {
     /// A game with no world open, over the loaded resources: the window's,
     /// or an integrated server's on its own thread.
     fn new(
-        res: &'a Arc<Resources>,
+        res: &Arc<Resources>,
         pack: PackResources,
         gui: UiResources,
         options: Options,
@@ -13804,18 +13808,20 @@ impl<'a> Game<'a> {
         );
         Ok(Game {
             res: res.clone(),
-            resource_source: res,
+            resource_source: res.clone(),
+            _lifetime: std::marker::PhantomData,
             rest_loader: None,
             pending_entry: None,
             world_loader: None,
+            quit_to_launcher: false,
             pending_pack_reload: false,
             local_pack_reload: None,
             server_packs: Default::default(),
             link_prompt: None,
             dialogs: Default::default(),
             world_renderer_ready: false,
-            collision: res.collision(),
-            motion: res.motion(),
+            collision: res.core.collision.clone(),
+            motion: res.core.motion.clone(),
             pack,
             gui,
             fog: Default::default(),
@@ -14452,7 +14458,8 @@ fn synchronous_startup(options: &Options) -> bool {
     options.frames.is_some()
         || options.world_frames.is_some()
         || options.benchmark.is_some()
-        || options.control.is_some()
+        // Native launcher automation must observe the same idle/start lifecycle as touch input.
+        || (options.control.is_some() && !horizon_ios_launcher::waiting())
         || !options.execution_role.is_client()
         || std::env::var_os("HORIZON_DISPENSE_FIXTURE").is_some()
         || std::env::var_os("HORIZON_SCULK_FIXTURE").is_some()
@@ -14603,8 +14610,8 @@ fn load_resources(
             facts,
             biomes: biomes.clone(),
             environment,
-            collision,
-            motion,
+            collision: Arc::new(collision),
+            motion: Arc::new(motion),
             threads,
         },
         rest: std::sync::OnceLock::new(),
@@ -14954,7 +14961,7 @@ fn loading_frame(hud: &HudBatch) -> Frame<'_> {
 /// finished here instead.
 #[allow(clippy::too_many_arguments)]
 fn start_game<'a>(
-    res: &'a Arc<Resources>,
+    res: &Arc<Resources>,
     pack: PackResources,
     gui: UiResources,
     options: Options,
@@ -15198,6 +15205,11 @@ impl Loading {
             }
         };
         horizon_client::telemetry::note_display(&window);
+        if horizon_ios_launcher::waiting() {
+            self.window = Some(window);
+            horizon_ios_launcher::present();
+            return;
+        }
         let offscreen = self.options.as_ref().is_some_and(|o| o.offscreen);
         match loading_renderer(
             window.clone(),
@@ -15274,6 +15286,42 @@ impl Loading {
             // No world is open yet: nothing to save.
             event_loop.exit();
             return;
+        }
+        if horizon_ios_launcher::waiting() {
+            if let Err(error) = self.poll_launcher() {
+                self.error = Some(error);
+                event_loop.exit();
+                return;
+            }
+            horizon_airplay::screen(false, false);
+            if horizon_ios_launcher::waiting() {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(
+                    Instant::now() + Duration::from_millis(100),
+                ));
+                return;
+            }
+        }
+        if self.handle.is_none() && self.loaded.is_none() && !self.importing() {
+            horizon_client::heartbeat::start();
+            horizon_client::discord_presence::start(self.settings.extras.discord_presence, false);
+            let result = startup_menu::spawn_loader(
+                self.options.as_ref().unwrap(),
+                &self.settings,
+                &self.vanilla_root,
+                self.started,
+                &self.progress,
+            );
+            match result {
+                Ok((receiver, handle)) => {
+                    self.receiver = receiver;
+                    self.handle = Some(handle);
+                }
+                Err(error) => {
+                    self.error = Some(error);
+                    event_loop.exit();
+                    return;
+                }
+            }
         }
         if let Err(error) = if self.importing() {
             self.poll_import()
@@ -15394,12 +15442,11 @@ impl Loading {
             Audio::new(&options.resources)
         };
         let pack_error = loaded.pack_error.or_else(|| self.pack_error.take());
-        // The game borrows its shared resources for the process's lifetime,
-        // like the single copy an integrated server would share.
-        let res: &'static Arc<Resources> = Box::leak(Box::new(loaded.resources));
+        // Each engine session owns its shared resources; Quit releases this generation.
+        let res = loaded.resources;
         let game_at = Instant::now();
         let Some(mut game) = start_game(
-            res,
+            &res,
             loaded.pack,
             gui,
             options,
@@ -15480,6 +15527,82 @@ impl App {
         }
         let step = match self {
             App::Ready(game) => {
+                if game.quit_to_launcher {
+                    game.audio.stop_all();
+                    horizon_client::heartbeat::stop();
+                    horizon_client::discord_presence::set(
+                        horizon_client::discord_presence::Status::Off,
+                    );
+                    horizon_airplay::screen(false, false);
+                    // Poll expensive workers to completion without blocking UIKit.
+                    let mut stopped = shader_packs::shutdown_parser();
+                    stopped &= game.shutdown_server_pack_worker();
+                    stopped &= world_loading::shutdown_preload();
+                    if let Some(renderer) = &mut game.renderer {
+                        stopped &= renderer.shutdown_pack_compiler();
+                    }
+                    stopped &= game
+                        .local_pack_reload
+                        .as_ref()
+                        .is_none_or(|worker| worker.is_finished());
+                    stopped &= game
+                        .rest_loader
+                        .as_ref()
+                        .is_none_or(|loader| loader.handle.is_finished());
+                    if let Some(loader) = game.world_loader.take() {
+                        game.world_loader = Some(if loader.cancelled {
+                            loader
+                        } else {
+                            loader.cancel()
+                        });
+                    }
+                    stopped &= game
+                        .world_loader
+                        .as_ref()
+                        .is_none_or(|loader| loader.ready());
+                    if !stopped {
+                        event_loop.set_control_flow(ControlFlow::WaitUntil(
+                            Instant::now() + Duration::from_millis(33),
+                        ));
+                        return;
+                    }
+                    if let Some(loader) = game.world_loader.take() {
+                        let _ = loader.finish();
+                    }
+                    game.exiting(event_loop);
+                    game.audio.stop_all();
+                    if let Some(worker) = game.local_pack_reload.take() {
+                        let _ = worker.join();
+                    }
+                    if let Some(loader) = game.rest_loader.take() {
+                        let _ = loader.finish();
+                    }
+                    let mut options = game.options.clone();
+                    let root = game.vanilla_root();
+                    options.resources = root.clone();
+                    options.world = None;
+                    options.server = None;
+                    horizon_ios_launcher::reset();
+                    match launcher_loading(
+                        options,
+                        game.settings.clone(),
+                        root,
+                        None,
+                        Instant::now(),
+                    ) {
+                        Ok(mut loading) => {
+                            loading.window = game.window.clone();
+                            *self = App::Loading(Box::new(loading));
+                            world_loading::release_world_data();
+                            horizon_airplay::screen(false, false);
+                        }
+                        Err(error) => {
+                            game.error = Some(error);
+                            event_loop.exit();
+                        }
+                    }
+                    return;
+                }
                 game.about_to_wait(event_loop);
                 return;
             }
@@ -15559,16 +15682,21 @@ impl ApplicationHandler for App {
 
 /// The ordinary launch: load the resources on a worker while the window shows
 /// the loading screen, then swap in the game on the main thread.
-fn run_loading(
+fn launcher_loading(
     options: Options,
     settings: Settings,
     vanilla_root: PathBuf,
     pack_error: Option<String>,
     started: Instant,
-) -> Result<()> {
+) -> Result<Loading> {
     let progress = Progress::new();
-    let (receiver, loader) =
-        startup_menu::spawn_loader(&options, &settings, &vanilla_root, started, &progress)?;
+    let (receiver, loader) = if horizon_ios_launcher::waiting() {
+        (std::sync::mpsc::channel().1, None)
+    } else {
+        let (receiver, loader) =
+            startup_menu::spawn_loader(&options, &settings, &vanilla_root, started, &progress)?;
+        (receiver, Some(loader))
+    };
     let menu = startup_menu::StartupMenu::new(&options, pack_error.as_deref())?;
     let loading = Loading {
         window: None,
@@ -15585,13 +15713,24 @@ fn run_loading(
         progress,
         receiver,
         loaded: None,
-        handle: Some(loader),
+        handle: loader,
         shown: false,
         menu,
         import: None,
         brand: Default::default(),
         error: None,
     };
+    Ok(loading)
+}
+
+fn run_loading(
+    options: Options,
+    settings: Settings,
+    vanilla_root: PathBuf,
+    pack_error: Option<String>,
+    started: Instant,
+) -> Result<()> {
+    let loading = launcher_loading(options, settings, vanilla_root, pack_error, started)?;
     let mut app = App::Loading(Box::new(loading));
     event_loop()?.run_app(&mut app)?;
     horizon_client::discord_presence::stop();
@@ -15670,7 +15809,8 @@ pub fn run() -> Result<()> {
     }
     // Someone is playing: the anonymous ping behind the launcher's "N playing now". Not for a
     // server, a benchmark or a run that quits by itself.
-    if options.execution_role.is_client()
+    if !horizon_ios_launcher::waiting()
+        && options.execution_role.is_client()
         && options.benchmark.is_none()
         && !options.offscreen
         && options.frames.is_none()
@@ -15686,7 +15826,7 @@ pub fn run() -> Result<()> {
     let vanilla_root = options.resources.clone();
     let early_settings = Settings::load(&std::env::current_dir()?.join("options.txt"));
     // "Playing Horizon" on Discord: never for a server; an automated run only talks to a test's fake Discord.
-    if options.dedicated.is_none() {
+    if options.dedicated.is_none() && !horizon_ios_launcher::waiting() {
         let automated = options.benchmark.is_some()
             || options.offscreen
             || options.frames.is_some()

@@ -112,6 +112,11 @@ pub fn start() {
     signal.notify_all();
 }
 
+/// Return to the launcher-only state after the engine has shut down.
+pub fn reset() {
+    *STARTED.0.lock().unwrap_or_else(PoisonError::into_inner) = Some(!bundled());
+}
+
 /// Whether the game is still waiting to be started.
 pub fn waiting() -> bool {
     let started = STARTED.0.lock().unwrap_or_else(PoisonError::into_inner);

@@ -112,7 +112,9 @@ final class GameLink: ObservableObject {
         let state = await Bridge.send("launcher-state")
         let was = phase
         switch state["phase"] as? String {
-        case "waiting": phase = .waiting
+        case "waiting":
+            if phase != .waiting { GameAudio.stop() }
+            phase = .waiting
         case "loading": phase = .loading(state["progress"] as? Double ?? 0)
         case "needs_files": phase = .needsFiles(state["reason"] as? String)
         case "title": phase = .title

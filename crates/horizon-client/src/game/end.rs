@@ -592,7 +592,7 @@ impl Game<'_> {
         self.portals.player.cooldown = 10;
         if player.health.dead_or_dying() {
             // Respawning out of the End: a fresh player at the spawn.
-            player = PlayerMotion::new(self.motion, target)?;
+            player = PlayerMotion::new(&self.motion, target)?;
             self.eye = 1.62;
             self.previous_eye = 1.62;
             self.clock.reset();

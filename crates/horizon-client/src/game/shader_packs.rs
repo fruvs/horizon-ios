@@ -135,6 +135,7 @@ struct ParsedPack {
     entity_ids: PackIds,
 }
 struct PendingLoad {
+    worker: Option<std::thread::JoinHandle<()>>,
     key: LoadKey,
     result: std::sync::mpsc::Receiver<Result<ParsedPack, String>>,
 }
@@ -143,12 +144,36 @@ thread_local! {
     // finish; it never spawns an unbounded group of large-stack workers.
     static PENDING_LOAD: RefCell<Option<PendingLoad>> = const { RefCell::new(None) };
 }
+pub(super) fn shutdown_parser() -> bool {
+    PENDING_LOAD.with_borrow_mut(|pending| {
+        if pending.as_ref().is_some_and(|load| {
+            load.worker
+                .as_ref()
+                .is_some_and(|worker| !worker.is_finished())
+        }) {
+            return false;
+        }
+        if let Some(load) = pending.take()
+            && let Some(worker) = load.worker
+        {
+            let _ = worker.join();
+        }
+        true
+    })
+}
 fn parser_busy() -> bool {
     PENDING_LOAD.with_borrow(|pending| pending.is_some())
 }
 fn poll_parser() -> Option<(LoadKey, Result<ParsedPack, String>)> {
     PENDING_LOAD.with_borrow_mut(|pending| {
         let load = pending.as_ref()?;
+        if load
+            .worker
+            .as_ref()
+            .is_some_and(|worker| !worker.is_finished())
+        {
+            return None;
+        }
         let result = match load.result.try_recv() {
             Ok(result) => result,
             Err(std::sync::mpsc::TryRecvError::Empty) => return None,
@@ -227,7 +252,13 @@ fn start_parser(key: LoadKey, inputs: horizon_shaders::GameInputs) -> Result<(),
             let _ = sender.send(parsed);
         })
         .map_err(|error| format!("Could not start shader parser: {error}"))?;
-    PENDING_LOAD.with_borrow_mut(|pending| *pending = Some(PendingLoad { key, result }));
+    PENDING_LOAD.with_borrow_mut(|pending| {
+        *pending = Some(PendingLoad {
+            key,
+            result,
+            worker: Some(_worker),
+        })
+    });
     Ok(())
 }
 
@@ -634,6 +665,42 @@ fn state_block_id_table(
 mod integration_tests {
     use super::*;
     #[test]
+    fn shutdown_waits_for_parser_and_discards_its_result() {
+        let (release, wait) = std::sync::mpsc::channel();
+        let (send, result) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            wait.recv().unwrap();
+            send.send(Err("cancelled result".into())).unwrap();
+        });
+        PENDING_LOAD.with_borrow_mut(|pending| {
+            *pending = Some(PendingLoad {
+                key: LoadKey {
+                    path: "shutdown.zip".into(),
+                    dimension: 0,
+                    context: (0, 0),
+                },
+                result,
+                worker: Some(worker),
+            })
+        });
+        assert!(!shutdown_parser());
+        release.send(()).unwrap();
+        while PENDING_LOAD.with_borrow(|pending| {
+            !pending
+                .as_ref()
+                .unwrap()
+                .worker
+                .as_ref()
+                .unwrap()
+                .is_finished()
+        }) {
+            std::thread::yield_now();
+        }
+        assert!(shutdown_parser());
+        assert!(!parser_busy());
+        assert!(shutdown_parser());
+    }
+    #[test]
     fn block_materials_use_exact_states_and_waterlogged_fluid_identity() {
         use horizon_world::{chunk::BlockState, nbt::Tag, registry::BlockRegistry};
         use std::collections::BTreeMap;
@@ -716,6 +783,7 @@ mod integration_tests {
             *pending = Some(PendingLoad {
                 key: key.clone(),
                 result,
+                worker: None,
             })
         });
         assert!(poll_parser().is_none());

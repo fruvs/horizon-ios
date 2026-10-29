@@ -336,7 +336,7 @@ impl Game<'_> {
         if self.block_in_tag("minecraft:climbable", name) || open_trapdoor {
             return VoxelShape::empty();
         }
-        let binding = self.collision;
+        let binding = &self.collision;
         let mut scene = SceneCollisions {
             world: &self.world,
             binding,
@@ -416,7 +416,7 @@ impl Game<'_> {
         );
         let mut scene = SceneCollisions {
             world: &self.world,
-            binding: self.collision,
+            binding: &self.collision,
             subject: None,
         };
         if !no_collision_empty(&mut scene, bounds) {
@@ -616,7 +616,7 @@ impl Game<'_> {
     pub(super) fn place_respawned(&mut self, config: RespawnConfig) -> Result<()> {
         match self.find_respawn_and_use(config, true)? {
             Some((position, yaw)) => {
-                let mut player = PlayerMotion::new(self.motion, position)?;
+                let mut player = PlayerMotion::new(&self.motion, position)?;
                 player.yaw = yaw;
                 player.head_yaw = yaw;
                 self.yaw = yaw;
@@ -650,7 +650,7 @@ impl Game<'_> {
                 // the point is forgotten.
                 self.respawn_config = None;
                 self.system_message(Text::translate("block.minecraft.spawn.not_valid", &[]));
-                let dead = PlayerMotion::new(self.motion, Vec3::ZERO)?;
+                let dead = PlayerMotion::new(&self.motion, Vec3::ZERO)?;
                 if self.dim != Dim::Overworld {
                     // A dead stand-in travels; the arrival makes a fresh player.
                     let mut dead = dead;

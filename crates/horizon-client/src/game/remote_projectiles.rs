@@ -422,7 +422,7 @@ impl Game<'_> {
         // runs out; only the server explodes it.
         let (world, collision, assets, facts) = (
             &self.world,
-            self.collision,
+            &self.collision,
             &self.pack.assets,
             self.res.facts(),
         );
@@ -490,7 +490,7 @@ impl Game<'_> {
         for r in &mut rockets {
             r.remote_step(&mut SceneCollisions {
                 world: &self.world,
-                binding: self.collision,
+                binding: &self.collision,
                 subject: None,
             });
             if let Some(target) = r.attached_to {

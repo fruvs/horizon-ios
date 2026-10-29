@@ -217,7 +217,7 @@ enum Preload {
         left: Option<std::time::Instant>,
     },
     /// A world opened: the data is the world's now, and stays.
-    Used,
+    Used(Option<std::thread::JoinHandle<()>>),
 }
 
 static PRELOAD: std::sync::Mutex<Preload> = std::sync::Mutex::new(Preload::Idle);
@@ -238,7 +238,7 @@ pub(super) fn preload_world_data(
 ) {
     let mut preload = PRELOAD.lock().unwrap_or_else(|e| e.into_inner());
     match &mut *preload {
-        Preload::Used => {}
+        Preload::Used(_) => {}
         Preload::Idle if on_world_screens => {
             let resources = resources.to_owned();
             let spawned = std::thread::Builder::new()
@@ -276,7 +276,40 @@ pub(super) fn preload_world_data(
 
 /// A world opens: what `preload_world_data` read is the world's from now on.
 pub(super) fn world_data_used() {
-    *PRELOAD.lock().unwrap_or_else(|e| e.into_inner()) = Preload::Used;
+    let mut preload = PRELOAD.lock().unwrap_or_else(|e| e.into_inner());
+    let previous = std::mem::replace(&mut *preload, Preload::Idle);
+    *preload = Preload::Used(match previous {
+        Preload::Started { thread, .. } => Some(thread),
+        Preload::Used(thread) => thread,
+        Preload::Idle => None,
+    });
+}
+
+/// Keep the preload's handle through world entry so engine shutdown can drain it.
+pub(super) fn shutdown_preload() -> bool {
+    let mut preload = PRELOAD.lock().unwrap_or_else(|e| e.into_inner());
+    let running = match &*preload {
+        Preload::Started { thread, .. } | Preload::Used(Some(thread)) => !thread.is_finished(),
+        _ => false,
+    };
+    if running {
+        return false;
+    }
+    match std::mem::replace(&mut *preload, Preload::Idle) {
+        Preload::Started { thread, .. } | Preload::Used(Some(thread)) => {
+            let _ = thread.join();
+        }
+        _ => {}
+    }
+    true
+}
+
+/// Called after the engine and its streaming pools are gone.
+pub(super) fn release_world_data() {
+    horizon_client::vanillagen::forget_shared_data();
+    horizon_client::structure_blocks::forget_loot_data();
+    super::lan::forget_sync_data();
+    horizon_threads::release_free_memory();
 }
 
 pub(super) fn make_streaming(
@@ -366,6 +399,30 @@ pub(super) fn make_streaming(
 mod tests {
     use super::*;
 
+    #[test]
+    fn used_preload_is_still_drained_before_shutdown() {
+        let (release, wait) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            wait.recv().unwrap();
+        });
+        *PRELOAD.lock().unwrap() = Preload::Started { thread, left: None };
+        world_data_used();
+        assert!(!shutdown_preload());
+        release.send(()).unwrap();
+        loop {
+            let ready = match &*PRELOAD.lock().unwrap() {
+                Preload::Used(Some(thread)) => thread.is_finished(),
+                _ => panic!("preload handle lost"),
+            };
+            if ready {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(shutdown_preload());
+        assert!(matches!(*PRELOAD.lock().unwrap(), Preload::Idle));
+        assert!(shutdown_preload());
+    }
     #[test]
     fn polling_does_not_wait_for_world_initialization() {
         let (release, wait) = std::sync::mpsc::channel();

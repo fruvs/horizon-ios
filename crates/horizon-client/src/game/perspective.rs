@@ -282,7 +282,7 @@ impl Game<'_> {
         let mut rays = VisualRays {
             scene: SceneCollisions {
                 world: &self.world,
-                binding: self.collision,
+                binding: &self.collision,
                 subject: None,
             },
             facts: self.res.facts(),

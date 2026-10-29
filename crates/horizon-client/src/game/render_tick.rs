@@ -321,7 +321,7 @@ impl Game<'_> {
         let ctx = AnimateContext {
             world,
             facts,
-            collision: self.collision,
+            collision: &self.collision,
             biomes,
             registry: self.pack.assets.registry,
             raining_at: &raining_at,
@@ -437,7 +437,7 @@ impl Game<'_> {
         let level = ParticleLevel {
             world,
             facts,
-            collision: self.collision,
+            collision: &self.collision,
             player: self
                 .player
                 .as_ref()

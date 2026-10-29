@@ -112,7 +112,7 @@ impl Game<'_> {
         let mut rays = ColliderRays {
             scene: SceneCollisions {
                 world: &self.world,
-                binding: self.collision,
+                binding: &self.collision,
                 subject: None,
             },
             context: CollisionContext::for_entity(

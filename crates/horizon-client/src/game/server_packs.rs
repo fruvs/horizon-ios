@@ -217,6 +217,21 @@ pub(super) struct PackReload {
 }
 
 impl Game<'_> {
+    pub(super) fn shutdown_server_pack_worker(&mut self) -> bool {
+        if self
+            .server_packs
+            .reload
+            .as_ref()
+            .is_some_and(|reload| !reload.handle.is_finished())
+        {
+            return false;
+        }
+        if let Some(reload) = self.server_packs.reload.take() {
+            let _ = reload.handle.join();
+        }
+        true
+    }
+
     /// `ConnectScreen`: the server's setting decides what its packs do
     /// (`configureForServerControl`); single player's own server takes them
     /// all, quietly (`configureForLocalWorld`).

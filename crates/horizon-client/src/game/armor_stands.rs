@@ -338,7 +338,7 @@ impl Game<'_> {
         );
         let mut scene = horizon_client::collisions::SceneCollisions {
             world: &self.world,
-            binding: self.collision,
+            binding: &self.collision,
             subject: None,
         };
         if !scene.unobstructed(bounds).unwrap_or(false)
@@ -547,7 +547,7 @@ impl Game<'_> {
     pub(super) fn tick_armor_stands(&mut self) {
         let mut scene = horizon_client::collisions::SceneCollisions {
             world: &self.world,
-            binding: self.collision,
+            binding: &self.collision,
             subject: None,
         };
         let mut dead = Vec::new();

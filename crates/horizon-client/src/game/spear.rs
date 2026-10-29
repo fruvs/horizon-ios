@@ -70,7 +70,7 @@ impl Game<'_> {
     fn clip_collider(&self, from: Vec3, to: Vec3) -> Option<Vec3> {
         let mut scene = SceneCollisions {
             world: &self.world,
-            binding: self.collision,
+            binding: &self.collision,
             subject: None,
         };
         traverse_blocks(from, to, 512, |p: BlockPos| {

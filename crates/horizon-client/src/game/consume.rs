@@ -159,8 +159,8 @@ impl Game<'_> {
             player,
             scene: &mut self.world,
             assets: &self.pack.assets,
-            collision_binding: self.collision,
-            resources: self.motion,
+            collision_binding: &self.collision,
+            resources: &self.motion,
         }
         .no_player_collision(bounds)
         .unwrap_or(false);
