@@ -178,11 +178,9 @@ mod system {
     }
 }
 
-/// A target with no desktop clipboard: a phone, where arboard has no backend (and on an iPhone the
-/// Wayland stack behind its Linux one cannot even compile). The game's own copy buffer is the whole of it,
-/// which is the behaviour the half above already falls back to when no compositor answers — text
-/// copied in the game still pastes in the game, and `horizon-ctl status` still reports it. iOS's
-/// real pasteboard (`UIPasteboard`) would replace this module, not the code that calls it.
+/// Mobile clipboard: UIKit's system pasteboard on iOS, and an in-game
+/// fallback on platforms without a native backend. System access occurs only
+/// on an explicit edit operation, never by polling clipboard contents.
 #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 mod system {
     use super::Clipboard;
@@ -202,10 +200,16 @@ mod system {
 
     impl Clipboard for SystemClipboard {
         fn get(&mut self) -> String {
+            #[cfg(target_os = "ios")]
+            if let Some(text) = horizon_gamecontroller::clipboard_text() {
+                return text;
+            }
             self.copied.clone().unwrap_or_default()
         }
         fn set(&mut self, text: &str) {
             if !text.is_empty() {
+                #[cfg(target_os = "ios")]
+                horizon_gamecontroller::set_clipboard_text(text);
                 self.copied = Some(text.to_owned());
             }
         }
