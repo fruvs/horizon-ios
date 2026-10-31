@@ -79,17 +79,6 @@ struct HomeView: View {
         .background(Theme.background.ignoresSafeArea())
         .tint(Theme.accent)
         .sheet(isPresented: $showingAccount) { accountSheet }
-        .alert("Offline player name", isPresented: $editingName) {
-            TextField("Name", text: $nameDraft).textInputAutocapitalization(.never).autocorrectionDisabled()
-            Button("Save") {
-                guard account.profile == nil else { return }
-                nameRejected = !player.save(nameDraft.trimmingCharacters(in: .whitespaces))
-            }
-            Button("Cancel", role: .cancel) {}
-        } message: { Text("Up to 16 characters, with no spaces.") }
-        .alert("That name can’t be used", isPresented: $nameRejected) {
-            Button("OK", role: .cancel) {}
-        } message: { Text("Use 1 to 16 characters with no spaces.") }
         .alert("Something went wrong", isPresented: Binding(
             get: { link.problem != nil }, set: { if !$0 { link.problem = nil } }
         )) { Button("OK", role: .cancel) {} } message: { Text(link.problem ?? "") }
@@ -128,6 +117,7 @@ struct HomeView: View {
 
     private func editName() {
         guard account.profile == nil else { return }
+        nameRejected = false
         nameDraft = player.name ?? ""
         editingName = true
     }
@@ -250,12 +240,51 @@ struct HomeView: View {
                 }
                 Section { AccountCard(account: account) }
             }
+            .navigationDestination(isPresented: $editingName) { offlineNameEditor }
             .navigationTitle("Account")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { showingAccount = false } } }
         }
         .presentationDetents([.medium, .large])
     }
+
+    private var offlineNameEditor: some View {
+        Form {
+            Section {
+                TextField("Name", text: $nameDraft)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .accessibilityIdentifier("offline-player-name")
+            } footer: {
+                if nameRejected {
+                    Text("That name can’t be used. Use 1 to 16 characters with no spaces.")
+                        .foregroundStyle(.red)
+                        .accessibilityIdentifier("offline-player-name-error")
+                } else {
+                    Text("Up to 16 characters, with no spaces.")
+                }
+            }
+        }
+        .navigationTitle("Offline player name")
+        .navigationBarTitleDisplayMode(.inline)
+        .navigationBarBackButtonHidden()
+        .toolbar {
+            ToolbarItem(placement: .cancellationAction) {
+                Button("Cancel") { editingName = false }
+            }
+            ToolbarItem(placement: .confirmationAction) {
+                Button("Save") {
+                    guard account.profile == nil else { return }
+                    if player.save(nameDraft.trimmingCharacters(in: .whitespaces)) {
+                        editingName = false
+                    } else {
+                        nameRejected = true
+                    }
+                }
+            }
+        }
+    }
+
 }
 
 struct Avatar: View {

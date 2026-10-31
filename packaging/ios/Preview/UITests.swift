@@ -36,11 +36,33 @@ final class LauncherLayoutTests: XCTestCase {
         let app = launch(signedIn: false)
         app.buttons["launcher-account-button"].tap()
         let edit = app.buttons["Change Offline Name"]
-        XCTAssertTrue(edit.waitForExistence(timeout: 5)); edit.tap()
-        let alert = app.alerts["Offline player name"]
-        XCTAssertTrue(alert.waitForExistence(timeout: 5))
-        alert.textFields.firstMatch.tap()
-        alert.buttons["Cancel"].tap()
+        let field = app.textFields["offline-player-name"]
+        func openEditor() {
+            XCTAssertTrue(edit.waitForExistence(timeout: 5)); edit.tap()
+            XCTAssertTrue(field.waitForExistence(timeout: 5))
+        }
+        openEditor()
+        field.doubleTap(); field.typeText("TrailRider")
+        XCTAssertEqual(field.value as? String, "TrailRider")
+        app.buttons["Save"].tap()
+        XCTAssertTrue(app.staticTexts["TrailRider"].firstMatch.waitForExistence(timeout: 5))
+
+        openEditor()
+        XCTAssertEqual(field.value as? String, "TrailRider")
+        field.tap(); field.typeText("_x")
+        app.buttons["Cancel"].tap()
+
+        openEditor()
+        XCTAssertEqual(field.value as? String, "TrailRider")
+        field.doubleTap(); field.typeText("Bad Name")
+        XCTAssertEqual(field.value as? String, "Bad Name")
+        app.buttons["Save"].tap()
+        XCTAssertTrue(app.staticTexts["offline-player-name-error"].waitForExistence(timeout: 5))
+        XCTAssertEqual(field.value as? String, "Bad Name")
+        app.buttons["Cancel"].tap()
+        openEditor()
+        XCTAssertEqual(field.value as? String, "TrailRider")
+        app.buttons["Cancel"].tap()
     }
     func testLauncherSettingsKeepOnlyGameFilesAndAbout() {
         let app = launch(signedIn: false, optionsResponse: "error")
