@@ -6,7 +6,21 @@ private let previewSubmit: HorizonSubmit = { pointer, context, done in
     let response: [String: Any]
     if let options = PreviewOptions.reply(line) { response = options }
     else { switch line {
-    case "launcher-state": response = ["phase": "title", "version": "26.3"]
+    case "launcher-state": response = ["phase": ProcessInfo.processInfo.environment["PREVIEW_MISSING_FILES"] == "1" ? "waiting" : "title", "version": "26.3"]
+    case "game-files-source":
+        if let url = ProcessInfo.processInfo.environment["PREVIEW_GAME_FILES_URL"] {
+            response = ["url": url, "version": "26.3"]
+        } else {
+            response = ["error": "Automatic downloads are disabled in the preview."]
+        }
+    case _ where line.hasPrefix("import-game-files "):
+        if ProcessInfo.processInfo.environment["PREVIEW_MISSING_FILES"] == "1",
+           let bytes = try? Data(contentsOf: URL(fileURLWithPath: String(line.dropFirst("import-game-files ".count)))),
+           bytes == Data("horizon-download-fixture".utf8) {
+            try? FileManager.default.createDirectory(at: GameFolder.resources, withIntermediateDirectories: true)
+            try? Data("{}".utf8).write(to: GameFolder.resources.appendingPathComponent("horizon-resources.json"))
+            response = ["ok": true, "kind": "resources"]
+        } else { response = ["error": "Unexpected preview fixture."] }
     case "worlds":
         response = ["worlds": [
             ["folder": "meadow", "name": "Meadow Valley", "mode": "survival", "version": "26.3", "last_played": Date().timeIntervalSince1970 * 1000 - 3600000],
@@ -31,6 +45,9 @@ struct LauncherPreview: App {
             if let value = ProcessInfo.processInfo.environment[key] {
                 try? FileManager.default.createDirectory(atPath: value, withIntermediateDirectories: true)
             }
+        }
+        if ProcessInfo.processInfo.environment["PREVIEW_MISSING_FILES"] == "1" {
+            try? FileManager.default.removeItem(at: GameFolder.resources)
         }
         Theme.registerFonts()
         Bridge.submit = previewSubmit
