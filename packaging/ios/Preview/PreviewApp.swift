@@ -1,8 +1,29 @@
 import SwiftUI
 import UIKit
 
+#if ORIENTATION_FIXTURE
+@main
+struct OrientationFixtureEntry {
+    static func main() {
+        UIApplicationMain(CommandLine.argc, CommandLine.unsafeArgv, nil,
+                          NSStringFromClass(OrientationFixtureAppDelegate.self))
+    }
+}
+#endif
+
 private let previewSubmit: HorizonSubmit = { pointer, context, done in
     let line = pointer.map { String(cString: $0) } ?? ""
+#if ORIENTATION_FIXTURE
+    if ProcessInfo.processInfo.environment["PREVIEW_GAME_PRESENTATION"] == "1",
+       line.hasPrefix("launcher-visible ") {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+            orientationFixtureRoot?.launcherVisible = line.hasSuffix(" true")
+            orientationFixtureRoot?.setNeedsUpdateOfSupportedInterfaceOrientations()
+            "{\"ok\":true}".withCString { done(context, $0) }
+        }
+        return
+    }
+#endif
     let response: [String: Any]
     if let options = PreviewOptions.reply(line) { response = options }
     else { switch line {
@@ -36,7 +57,9 @@ private let previewSubmit: HorizonSubmit = { pointer, context, done in
     String(data: data, encoding: .utf8)!.withCString { done(context, $0) }
 }
 
+#if !ORIENTATION_FIXTURE
 @main
+#endif
 struct LauncherPreview: App {
     @State private var previewNotice = false
     init() {
@@ -71,3 +94,69 @@ struct LauncherPreview: App {
         }
     }
 }
+
+#if ORIENTATION_FIXTURE
+// UIKit fixture uses the production presenter, unlike the SwiftUI-only preview.
+private weak var orientationFixtureRoot: OrientationFixtureGameController?
+
+private final class OrientationFixtureAppDelegate: NSObject, UIApplicationDelegate {
+    func application(_ application: UIApplication, didFinishLaunchingWithOptions options: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
+        Theme.registerFonts()
+        Bridge.submit = previewSubmit
+        UserDefaults.standard.removeObject(forKey: "microsoftProfile")
+        return true
+    }
+    func application(_ application: UIApplication, configurationForConnecting session: UISceneSession,
+                     options: UIScene.ConnectionOptions) -> UISceneConfiguration {
+        let config = UISceneConfiguration(name: "Orientation fixture", sessionRole: session.role)
+        config.delegateClass = OrientationFixtureSceneDelegate.self
+        return config
+    }
+}
+private final class OrientationFixtureSceneDelegate: NSObject, UIWindowSceneDelegate {
+    var window: UIWindow?
+    func scene(_ scene: UIScene, willConnectTo session: UISceneSession, options: UIScene.ConnectionOptions) {
+        guard let scene = scene as? UIWindowScene else { return }
+        let game = OrientationFixtureGameController()
+        orientationFixtureRoot = game
+        let window = UIWindow(windowScene: scene)
+        window.rootViewController = game
+        self.window = window
+        window.makeKeyAndVisible()
+    }
+}
+private final class OrientationFixtureGameController: UIViewController {
+    var launcherVisible = false
+    private var firstAppearance = true
+    override var supportedInterfaceOrientations: UIInterfaceOrientationMask {
+        launcherVisible ? .allButUpsideDown : .landscape
+    }
+    override var preferredInterfaceOrientationForPresentation: UIInterfaceOrientation { .landscapeRight }
+    override func present(_ controller: UIViewController, animated: Bool, completion: (() -> Void)? = nil) {
+        controller.view.accessibilityIdentifier = launcherVisible
+            ? "launcher-presentation-permission-ready" : "launcher-presentation-before-permission"
+        super.present(controller, animated: animated, completion: completion)
+    }
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        view.backgroundColor = .systemBackground
+        let label = UILabel()
+        label.text = "Game fixture"
+        label.accessibilityIdentifier = "orientation-game-root"
+        label.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(label)
+        NSLayoutConstraint.activate([label.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+                                     label.centerYAnchor.constraint(equalTo: view.centerYAnchor)])
+    }
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        guard firstAppearance else { return }
+        firstAppearance = false
+        turn(view.window?.windowScene, to: .landscape)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+            _ = horizonLauncherPresent(previewSubmit)
+        }
+    }
+}
+
+#endif
